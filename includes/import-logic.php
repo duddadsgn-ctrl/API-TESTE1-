@@ -4,11 +4,6 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-// Funções necessárias para o upload de imagens
-require_once( ABSPATH . 'wp-admin/includes/media.php' );
-require_once( ABSPATH . 'wp-admin/includes/file.php' );
-require_once( ABSPATH . 'wp-admin/includes/image.php' );
-
 /**
  * Manipula a submissão do formulário de importação.
  */
@@ -317,6 +312,12 @@ function vit_update_property_fields( $post_id, $property_data, &$log ) {
  * @param array &$log           Array de logs.
  */
 function vit_process_property_images( $post_id, $property_data, &$log ) {
+    // *** CORREÇÃO APLICADA AQUI ***
+    // Carrega os arquivos necessários para o upload de imagens apenas quando esta função for chamada.
+    require_once( ABSPATH . 'wp-admin/includes/media.php' );
+    require_once( ABSPATH . 'wp-admin/includes/file.php' );
+    require_once( ABSPATH . 'wp-admin/includes/image.php' );
+
     if ( empty( $property_data['Foto'] ) || ! is_array( $property_data['Foto'] ) ) {
         $log[] = 'Nenhuma imagem encontrada para este imóvel.';
         return;
@@ -433,7 +434,7 @@ function vit_sideload_image( $file_url, $post_id, $desc ) {
 
     $file_array = [];
     preg_match( '/[^\?]+\.(jpg|jpe|jpeg|gif|png)/i', $file_url, $matches );
-    $file_array['name'] = basename( $matches[0] );
+    $file_array['name'] = basename( $matches[0] ?? $file_url );
     $file_array['tmp_name'] = $tmp;
 
     // Se o nome do arquivo não puder ser determinado, remove o arquivo temporário
@@ -444,4 +445,10 @@ function vit_sideload_image( $file_url, $post_id, $desc ) {
 
     $id = media_handle_sideload( $file_array, $post_id, $desc );
 
-    // Se o
+    // Se o sideload falhar, remove o arquivo temporário
+    if ( is_wp_error( $id ) ) {
+        @unlink( $file_array['tmp_name'] );
+    }
+
+    return $id;
+}
