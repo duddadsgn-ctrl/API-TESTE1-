@@ -24,6 +24,7 @@ define( 'VIT_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 require_once VIT_PLUGIN_PATH . 'includes/post-type.php';
 require_once VIT_PLUGIN_PATH . 'includes/admin-page.php';
 require_once VIT_PLUGIN_PATH . 'includes/import-logic.php';
+require_once VIT_PLUGIN_PATH . 'includes/format-values.php';
 
 // Ações principais do plugin
 add_action( 'init', 'vit_register_imoveis_post_type' );
