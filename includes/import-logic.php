@@ -1,11 +1,10 @@
 <?php
-// Prevenir acesso direto.
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
 /**
- * Manipula a submissão do formulário de importação.
+ * Handler do botão "Importar 1 imóvel de teste".
  */
 function vit_handle_import_single_property() {
     if ( ! isset( $_POST['vit_import_nonce_field'] ) || ! wp_verify_nonce( $_POST['vit_import_nonce_field'], 'vit_import_nonce_action' ) ) {
@@ -15,277 +14,786 @@ function vit_handle_import_single_property() {
         wp_die( 'Você não tem permissão para executar esta ação.' );
     }
 
-    // Coleta e sanitiza os dados do formulário
-    $api_url = esc_url_raw( $_POST['vit_api_url'] );
-    $api_key = sanitize_text_field( $_POST['vit_api_key'] );
-    $property_code = sanitize_text_field( $_POST['vit_property_code'] );
-    $api_filter_categoria = sanitize_text_field( $_POST['vit_api_filter_categoria'] );
-    $api_filter_finalidade = sanitize_text_field( $_POST['vit_api_filter_finalidade'] );
+    $api_url = esc_url_raw( $_POST['vit_api_url'] ?? '' );
+    $api_key = sanitize_text_field( $_POST['vit_api_key'] ?? '' );
 
-    // Salva as opções para preenchimento futuro do formulário
     update_option( 'vit_api_url', $api_url );
     update_option( 'vit_api_key', $api_key );
-    update_option( 'vit_property_code', $property_code );
-    update_option( 'vit_api_filter_categoria', $api_filter_categoria );
-    update_option( 'vit_api_filter_finalidade', $api_filter_finalidade );
 
-    // Monta o array de filtros para a API
-    $api_filters = [];
-    if ( ! empty( $api_filter_categoria ) ) {
-        $api_filters['Categoria'] = $api_filter_categoria;
-    }
-    if ( ! empty( $api_filter_finalidade ) ) {
-        $api_filters['Finalidade'] = $api_filter_finalidade;
-    }
+    $report = vit_import_property( $api_url, $api_key );
 
-    // Executa a lógica de importação
-    $report = vit_import_property( $api_url, $api_key, $property_code, $api_filters );
-
-    set_transient( 'vit_import_report', $report, 60 );
+    set_transient( 'vit_import_report', $report, 120 );
     wp_redirect( admin_url( 'admin.php?page=vista-imovel-teste' ) );
     exit;
 }
 
 /**
- * Função principal que orquestra a importação do imóvel.
+ * Função principal: descobre automaticamente 1 imóvel bom, busca detalhes e importa.
  */
-function vit_import_property( $api_url, $api_key, $property_code = '', $api_filters = [] ) {
+function vit_import_property( $api_url, $api_key ) {
     $log = [];
-    $log[] = 'Iniciando processo de importação...';
-    $log[] = 'Consultando API Vista...';
-    $property_data = null;
+    $log[] = '================ INÍCIO DA IMPORTAÇÃO ================';
+    $log[] = 'Data/hora: ' . current_time( 'mysql' );
 
-    if ( ! empty( $property_code ) ) {
-        // Se um código é fornecido, a busca é direta para /detalhes via POST.
-        $log[] = "Buscando detalhes do imóvel com código: {$property_code}.";
-        $endpoint = '/imoveis/detalhes';
-        $post_fields = [ 'imovel' => $property_code, 'fields' => [] ];
-        $response = vit_call_api_post( $api_url, $endpoint, $api_key, $post_fields, $log );
-        
-        if ( is_wp_error( $response ) ) {
-            $log[] = 'ERRO FINAL: ' . $response->get_error_message();
-            return [ 'status' => 'error', 'log' => $log ];
-        }
-        $property_data = $response;
-
-    } else {
-        // Se nenhum código é fornecido, busca na lista usando GET com filtros.
-        $log[] = 'Buscando lista de imóveis para pegar o primeiro...';
-        $endpoint_list = '/imoveis/listar';
-        
-        // Monta os parâmetros para a chamada GET
-        $list_params = [
-            'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ]
-        ];
-        
-        // Adiciona os filtros obrigatórios diretamente no corpo dos parâmetros
-        if ( ! empty( $api_filters ) ) {
-            $list_params = array_merge($list_params, $api_filters);
-        }
-
-        // A chamada para /listar é via GET, com os parâmetros enviados como um JSON na URL.
-        $response_list = vit_call_api_get( $api_url, $endpoint_list, $api_key, $list_params, $log );
-
-        if ( is_wp_error( $response_list ) ) {
-            $log[] = 'ERRO FINAL: ' . $response_list->get_error_message();
-            return [ 'status' => 'error', 'log' => $log ];
-        }
-
-        if ( empty( $response_list ) || ! is_array( $response_list ) || isset($response_list['status']) ) {
-            $log[] = 'ERRO: A lista de imóveis retornou vazia ou em formato inesperado. Verifique se os filtros (Categoria) estão corretos.';
-            $log[] = 'Resposta da API: ' . json_encode($response_list);
-            return [ 'status' => 'error', 'log' => $log ];
-        }
-        
-        // Forma robusta de pegar o primeiro imóvel e seu código
-        $first_property_item = reset($response_list); // Pega o primeiro elemento do array
-        
-        if ( empty( $first_property_item ) || ! isset( $first_property_item['Codigo'] ) ) {
-            $log[] = 'ERRO: Nenhum imóvel encontrado com os filtros fornecidos ou a resposta não contém um código de imóvel.';
-            return [ 'status' => 'error', 'log' => $log ];
-        }
-        $property_code = $first_property_item['Codigo'];
-
-        $log[] = "Imóvel encontrado na lista com código: {$property_code}. Buscando detalhes completos...";
-        $endpoint_details = '/imoveis/detalhes';
-        $post_fields_details = [ 'imovel' => $property_code, 'fields' => [] ];
-        $response_details = vit_call_api_post( $api_url, $endpoint_details, $api_key, $post_fields_details, $log );
-
-        if ( is_wp_error( $response_details ) ) {
-            $log[] = 'ERRO FINAL: ' . $response_details->get_error_message();
-            return [ 'status' => 'error', 'log' => $log ];
-        }
-        $property_data = $response_details;
-    }
-
-    if ( empty( $property_data ) || ! isset( $property_data['Codigo'] ) ) {
-        $log[] = "ERRO: Imóvel com código '{$property_code}' não encontrado ou resposta da API inválida.";
+    if ( empty( $api_url ) || empty( $api_key ) ) {
+        $log[] = 'ERRO: API URL e API Key são obrigatórios.';
         return [ 'status' => 'error', 'log' => $log ];
     }
 
-    $log[] = "Dados do imóvel '{$property_data['Codigo']}' recebidos com sucesso.";
-    $post_id = vit_get_or_create_property_post( $property_data['Codigo'], $log );
-    vit_update_property_fields( $post_id, $property_data, $log );
-    vit_process_property_images( $post_id, $property_data, $log );
+    // ============ FASE 1: buscar lista de candidatos ============
+    $log[] = '';
+    $log[] = '--- FASE 1: buscando lista de candidatos em /imoveis/listar ---';
 
-    $log[] = '---------------------------------';
-    $log[] = 'RESUMO:';
-    $log[] = 'Status: SUCESSO';
-    $log[] = 'ID do Post: ' . $post_id;
-    $log[] = 'Código do Imóvel: ' . $property_data['Codigo'];
-    $log[] = 'Título: ' . get_the_title( $post_id );
-    $log[] = 'Link para Editar: ' . get_edit_post_link( $post_id );
-    $log[] = '---------------------------------';
-    $log[] = 'Importação concluída!';
+    // IMPORTANTE: /imoveis/listar NÃO aceita o campo "Foto" — ele só existe em /detalhes.
+    $list_params = [
+        'fields'    => [ 'Codigo', 'TituloSite', 'Status', 'Categoria', 'Finalidade', 'Dormitorios', 'Cidade', 'Bairro' ],
+        'paginacao' => [ 'pagina' => 1, 'quantidade' => 20 ],
+    ];
+
+    $list_response = vit_call_api_get( $api_url, '/imoveis/listar', $api_key, $list_params, $log );
+
+    if ( is_wp_error( $list_response ) ) {
+        $log[] = 'ERRO FINAL (listar): ' . $list_response->get_error_message();
+        return [ 'status' => 'error', 'log' => $log ];
+    }
+
+    $candidates = vit_extract_candidates( $list_response, $log );
+    if ( empty( $candidates ) ) {
+        $log[] = 'ERRO: A API não retornou nenhum imóvel utilizável em /imoveis/listar.';
+        return [ 'status' => 'error', 'log' => $log ];
+    }
+
+    // ============ FASE 2: pegar o primeiro imóvel disponível ============
+    $log[] = '';
+    $log[] = '--- FASE 2: selecionando imóvel ---';
+    $log[] = 'Total de imóveis recebidos: ' . count( $candidates );
+
+    $chosen       = $candidates[0];
+    $property_code = $chosen['Codigo'] ?? '';
+    $categoria     = $chosen['Categoria'] ?? '';
+    $finalidade    = $chosen['Finalidade'] ?? '';
+
+    $log[] = sprintf(
+        'Imóvel selecionado: código=%s | Categoria=%s | Status=%s | Cidade=%s',
+        $property_code,
+        $categoria ?: '-',
+        $chosen['Status']      ?? '-',
+        $chosen['Cidade']      ?? '-'
+    );
+
+    // ============ FASE 3: buscar detalhes completos ============
+    $log[] = '';
+    $log[] = '--- FASE 3: buscando detalhes em /imoveis/detalhes ---';
+
+    $details_response = vit_call_detalhes( $api_url, $api_key, $property_code, $categoria, $finalidade, $log );
+
+    if ( is_wp_error( $details_response ) ) {
+        $log[] = 'ERRO FINAL (detalhes): ' . $details_response->get_error_message();
+        $log[] = 'Usando apenas dados da listagem para importação parcial...';
+        $details_response = [];
+    }
+
+    // ============ MERGE listar + detalhes ============
+    // Base: dados do candidato da listagem (já tem TituloSite, Categoria, Status, Cidade, etc.)
+    // Por cima: campos do detalhes, mas só quando não vazio
+    $log[] = '';
+    $log[] = '--- MERGE: dados da listagem + detalhes ---';
+    $log[] = 'Dados da listagem (' . count( $chosen ) . ' campos): ' . implode( ', ', array_keys( $chosen ) );
+    $log[] = 'Dados do detalhe (' . count( $details_response ) . ' campos): ' . implode( ', ', array_keys( $details_response ) );
+
+    $property_data = $chosen; // Base: dados da listagem
+    $field_origins = [];
+
+    // Registra origem dos campos da listagem
+    foreach ( $chosen as $k => $v ) {
+        $field_origins[ $k ] = ( $v !== '' && $v !== null ) ? 'listar' : 'vazio';
+    }
+
+    // Merge com detalhes: detalhe vence apenas quando não for vazio
+    foreach ( $details_response as $k => $v ) {
+        $detail_has_value = ( $v !== '' && $v !== null && ! ( is_array( $v ) && empty( $v ) ) );
+        if ( $detail_has_value ) {
+            $property_data[ $k ]  = $v;
+            $field_origins[ $k ]  = 'detalhes';
+        } elseif ( ! isset( $property_data[ $k ] ) ) {
+            $property_data[ $k ]  = $v;
+            $field_origins[ $k ]  = 'vazio';
+        }
+    }
+
+    if ( empty( $property_data['Codigo'] ) ) {
+        $log[] = "ERRO: nenhum código de imóvel disponível após merge.";
+        return [ 'status' => 'error', 'log' => $log ];
+    }
+
+    $log[] = "Campos após merge: " . count( $property_data ) . " | Código: " . $property_data['Codigo'];
+
+    // ============ FASE 4: criar/atualizar post e salvar campos ============
+    $log[] = '';
+    $log[] = '--- FASE 4: criando/atualizando post no WordPress ---';
+
+    $post_id = vit_get_or_create_property_post( $property_data['Codigo'], $log );
+    if ( ! $post_id ) {
+        $log[] = 'ERRO: falha ao criar/localizar o post.';
+        return [ 'status' => 'error', 'log' => $log ];
+    }
+
+    $field_counters = [ 'saved' => 0, 'empty' => 0 ];
+    vit_update_property_fields( $post_id, $property_data, $log, $field_counters, $field_origins );
+
+    // ============ FASE 5: imagens ============
+    $log[] = '';
+    $log[] = '--- FASE 5: processando imagens ---';
+    $image_counters = [ 'found' => 0, 'imported' => 0, 'failed' => 0, 'thumbnail_set' => false, 'thumbnail_id' => 0 ];
+    vit_process_property_images( $post_id, $property_data, $log, $image_counters );
+
+    // ============ RESUMO FINAL ============
+    $log[] = '';
+    $log[] = '========== RELATÓRIO FINAL ==========';
+    $log[] = 'ID do Post WordPress : ' . $post_id;
+    $log[] = 'Código do Imóvel     : ' . $property_data['Codigo'];
+    $log[] = 'Título               : ' . get_the_title( $post_id );
+    $log[] = 'Categoria (CRM)      : ' . ( $property_data['Categoria']   ?? '-' );
+    $log[] = 'Finalidade (CRM)     : ' . ( $property_data['Finalidade']  ?? '-' );
+    $log[] = 'Status (CRM)         : ' . ( $property_data['Status']      ?? '-' );
+    $log[] = '';
+    $log[] = 'Campos salvos        : ' . $field_counters['saved'];
+    $log[] = 'Campos vazios        : ' . $field_counters['empty'];
+    $log[] = '';
+    $log[] = 'Imagens encontradas  : ' . $image_counters['found'];
+    $log[] = 'Imagens importadas   : ' . $image_counters['imported'];
+    $log[] = 'Imagens falhadas     : ' . $image_counters['failed'];
+    $log[] = 'Thumbnail definida   : ' . ( $image_counters['thumbnail_set'] ? ( 'SIM (ID: ' . $image_counters['thumbnail_id'] . ')' ) : 'NÃO' );
+    $log[] = '';
+    $log[] = 'Link para editar     : ' . get_edit_post_link( $post_id, 'raw' );
+    $log[] = '=====================================';
+    $log[] = 'Importação concluída com sucesso!';
 
     return [ 'status' => 'success', 'log' => $log ];
 }
 
 /**
- * Faz a chamada para a API Vista usando GET (para /listar).
- * Os parâmetros são enviados como uma string JSON em um parâmetro 'pesquisa'.
+ * Normaliza a resposta de /imoveis/listar em array de candidatos.
+ * A API pode retornar: array numérico, objeto com chaves numéricas como strings, ou payload com "total".
  */
-function vit_call_api_get( $base_url, $endpoint, $api_key, $params = [], &$log ) {
-    $url = rtrim( $base_url, '/' ) . $endpoint;
-    
-    $query_args = [ 'key' => $api_key ];
-    if ( ! empty( $params ) ) {
-        $query_args['pesquisa'] = json_encode($params);
+function vit_extract_candidates( $response, &$log ) {
+    if ( ! is_array( $response ) ) {
+        $log[] = 'Resposta da listar não é array. Ignorando.';
+        return [];
     }
-    
-    $url = add_query_arg( $query_args, $url );
 
-    $log[] = "Endpoint: GET " . $endpoint;
-    $log[] = "URL da Requisição (sem a chave): " . remove_query_arg('key', $url);
-    $log[] = "Parâmetros enviados em 'pesquisa': " . json_encode($params, JSON_UNESCAPED_UNICODE);
+    $items = [];
+    foreach ( $response as $key => $value ) {
+        if ( in_array( $key, [ 'paginacao', 'total', 'pagina', 'quantidade' ], true ) ) continue;
+        if ( is_array( $value ) && isset( $value['Codigo'] ) ) {
+            $items[] = $value;
+        }
+    }
+    return $items;
+}
 
-    $args = [ 
-        'method' => 'GET', 
-        'timeout' => 30,
-        'headers' => [ 'Accept' => 'application/json' ],
+/**
+ * Busca detalhes do imóvel no formato G confirmado.
+ * Faz 2 chamadas: uma para campos de texto, outra só para fotos.
+ * Retorna merge das duas respostas.
+ */
+function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidade, &$log ) {
+    $base = rtrim( $base_url, '/' ) . '/imoveis/detalhes';
+
+    $cat_arr = [];
+    if ( ! empty( $categoria ) )  $cat_arr['Categoria']  = $categoria;
+    if ( ! empty( $finalidade ) ) $cat_arr['Finalidade'] = $finalidade;
+
+    // Campos de texto — sem Foto (não é campo válido como string neste endpoint)
+    $text_fields = [
+        'Codigo','CodigoCorretor','TituloSite','DescricaoWeb',
+        'Bairro','BairroComercial','Cidade','UF','Latitude','Longitude',
+        'Status','Finalidade','Categoria','Moeda','Exclusivo',
+        'Dormitorios','Suites','BanheiroSocialQtd','Vagas',
+        'AreaTotal','AreaPrivativa',
+        'ValorVenda','ValorLocacao','ValorIptu','ValorCondominio',
+        'Caracteristicas','InfraEstrutura','Imediacoes',
+        'DestaqueWeb','Lancamento','FotoDestaque','FotoDestaquePequena','ExibirNoSite',
     ];
-    $response = wp_remote_get( $url, $args );
+
+    // ---- Chamada 1: campos de texto ----
+    $url1 = add_query_arg( array_merge(
+        [ 'key' => $api_key, 'imovel' => $codigo ],
+        $cat_arr,
+        [ 'pesquisa' => wp_json_encode( [ 'fields' => $text_fields ] ) ]
+    ), $base );
+
+    $log[] = 'Chamada 1/2 (campos texto): ' . wp_json_encode( $text_fields );
+    $data_text = vit_raw_get( $url1, $log );
+
+    if ( is_wp_error( $data_text ) ) {
+        // Se fields explícito falhar, tenta sem fields (retorna o que vier)
+        $log[] = 'Campos explícitos falharam: ' . $data_text->get_error_message() . ' — tentando sem fields...';
+        $url_empty = add_query_arg( array_merge(
+            [ 'key' => $api_key, 'imovel' => $codigo ],
+            $cat_arr,
+            [ 'pesquisa' => wp_json_encode( [ 'fields' => [] ] ) ]
+        ), $base );
+        $data_text = vit_raw_get( $url_empty, $log );
+    }
+
+    if ( is_wp_error( $data_text ) ) {
+        return $data_text;
+    }
+
+    // ---- Chamada 2: fotos (nested spec) ----
+    // Vista CRM usa nomes "Foto" e "FotoPequena" DENTRO do sub-objeto Foto.
+    // Formato real da API: {"Foto":[{"Foto":"url_grande","FotoPequena":"url_pq","Destaque":"Sim","Ordem":"1"},...]}
+    $photo_attempts = [
+        // Nomes reais da Vista (primária)
+        [ 'Foto' => [ 'Foto', 'FotoPequena', 'Destaque', 'Ordem' ] ],
+        // Sem lista de subcampos (API devolve tudo que houver)
+        [ 'Foto' => [] ],
+        // Nomes alternativos antigos
+        [ 'Foto' => [ 'URLFoto', 'URLFotoPequena', 'Destaque', 'Ordem' ] ],
+        [ 'Fotos' => [ 'Foto', 'FotoPequena', 'Destaque', 'Ordem' ] ],
+        [ 'Imagens' => [ 'Foto', 'FotoPequena', 'Destaque', 'Ordem' ] ],
+    ];
+
+    $data_foto = null;
+    $used_key  = null;
+    foreach ( $photo_attempts as $photo_spec ) {
+        $field_key  = array_key_first( $photo_spec );
+        $subfields  = $photo_spec[ $field_key ];
+        $url_foto   = add_query_arg( array_merge(
+            [ 'key' => $api_key, 'imovel' => $codigo ],
+            $cat_arr,
+            [ 'pesquisa' => wp_json_encode( [ 'fields' => [ $photo_spec ] ] ) ]
+        ), $base );
+
+        $log[] = sprintf(
+            "Chamada 2/2 (fotos): campo='%s' subfields=%s",
+            $field_key,
+            empty( $subfields ) ? '[] (todos)' : wp_json_encode( $subfields )
+        );
+        $resp = vit_raw_get( $url_foto, $log );
+
+        if ( ! is_wp_error( $resp ) && is_array( $resp ) ) {
+            // Procura o bloco de fotos na resposta
+            foreach ( [ 'Foto', 'Fotos', 'Imagens' ] as $fk ) {
+                if ( ! empty( $resp[ $fk ] ) && is_array( $resp[ $fk ] ) ) {
+                    $data_foto = $resp;
+                    $used_key  = $fk;
+                    break 2;
+                }
+            }
+            $log[] = "  resposta OK mas sem bloco de fotos (chaves: " . implode( ', ', array_keys( $resp ) ) . ")";
+            continue;
+        }
+        if ( is_wp_error( $resp ) ) {
+            $log[] = "  '{$field_key}' não disponível: " . $resp->get_error_message();
+        }
+    }
+
+    // Merge: começar com data_text, completar com data_foto se houver
+    $merged = $data_text;
+    if ( $data_foto && $used_key ) {
+        $photos = $data_foto[ $used_key ];
+        $merged[ $used_key ] = $photos;
+        $merged['Foto']      = $photos; // normaliza: sempre disponível em "Foto"
+        $log[] = "Fotos recebidas no campo '{$used_key}': " . count( $photos );
+
+        // Log das chaves do primeiro item para debug
+        if ( ! empty( $photos[0] ) && is_array( $photos[0] ) ) {
+            $log[] = '  Chaves do 1º item de foto: ' . implode( ', ', array_keys( $photos[0] ) );
+            $first_preview = wp_json_encode( $photos[0], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+            if ( mb_strlen( $first_preview ) > 300 ) $first_preview = mb_substr( $first_preview, 0, 300 ) . '...';
+            $log[] = '  Exemplo: ' . $first_preview;
+        }
+    } else {
+        $log[] = 'Bloco de fotos não retornado pela API neste endpoint (todas as tentativas falharam).';
+    }
+
+    return $merged;
+}
+
+/**
+ * Força CURLOPT_CONNECTTIMEOUT e CURLOPT_TIMEOUT nas requisições do plugin.
+ * Alguns hosts/plugins filtram http_request_args e reduzem o timeout para
+ * 10s — este hook roda DEPOIS disso e sobrescreve direto no cURL handle.
+ * Ativo apenas durante nossas chamadas (via flag global).
+ */
+function vit_force_curl_timeout( $handle, $r, $url ) {
+    if ( empty( $GLOBALS['vit_force_timeout'] ) ) return;
+    $t = (int) $GLOBALS['vit_force_timeout'];
+    curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, $t );
+    curl_setopt( $handle, CURLOPT_TIMEOUT, $t );
+}
+add_action( 'http_api_curl', 'vit_force_curl_timeout', 9999, 3 );
+
+/**
+ * Descobre o código de erro cURL (ex.: 28) a partir de uma mensagem WP_Error.
+ */
+function vit_parse_curl_code( $msg ) {
+    if ( preg_match( '/cURL error (\d+)/i', $msg, $m ) ) {
+        return (int) $m[1];
+    }
+    return 0;
+}
+
+/**
+ * Wrapper de GET com retry + log completo de conectividade.
+ * - Força timeout no cURL handle (não pode ser filtrado por host)
+ * - 3 tentativas, log de: timeout configurado, endpoint, tempo real, erro
+ */
+function vit_get_with_retry( $url, &$log, $timeout = 45, $max = 3 ) {
+    $transient_codes = [ 28, 6, 7, 35, 56 ]; // timeout, DNS, conn refused, SSL, recv
+
+    $host = parse_url( $url, PHP_URL_HOST ) ?: '(sem host)';
+    $path = parse_url( $url, PHP_URL_PATH ) ?: '/';
+    $log[] = sprintf( "  [CONECTIVIDADE] host=%s path=%s timeout_configurado=%ds tentativas_max=%d",
+        $host, $path, $timeout, $max );
+
+    $last = null;
+    for ( $i = 1; $i <= $max; $i++ ) {
+        $GLOBALS['vit_force_timeout'] = $timeout;
+        $t0   = microtime( true );
+        $resp = wp_remote_get( $url, [
+            'timeout'     => $timeout,
+            'redirection' => 5,
+            'headers'     => [ 'Accept' => 'application/json' ],
+        ] );
+        $elapsed_ms = (int) round( ( microtime( true ) - $t0 ) * 1000 );
+        unset( $GLOBALS['vit_force_timeout'] );
+
+        if ( ! is_wp_error( $resp ) ) {
+            $http = wp_remote_retrieve_response_code( $resp );
+            $log[] = sprintf( "  [CONECTIVIDADE] Tentativa %d/%d: OK em %dms (HTTP %s)", $i, $max, $elapsed_ms, $http );
+            return $resp;
+        }
+
+        $msg       = $resp->get_error_message();
+        $curl_code = vit_parse_curl_code( $msg );
+        $tipo      = $curl_code ? "cURL-{$curl_code}" : 'wp_error';
+        $log[] = sprintf( "  [CONECTIVIDADE] Tentativa %d/%d: FALHOU em %dms | tipo=%s | msg=%s",
+            $i, $max, $elapsed_ms, $tipo, $msg );
+
+        // Se elapsed está muito abaixo do timeout, algo está cortando
+        if ( $curl_code === 28 && $elapsed_ms < ( $timeout * 1000 - 2000 ) ) {
+            $log[] = sprintf(
+                "  [CONECTIVIDADE] ATENÇÃO: timeout ocorreu em %dms mas o configurado era %ds (%dms). Host/firewall cortando antes.",
+                $elapsed_ms, $timeout, $timeout * 1000
+            );
+        }
+
+        $is_transient = in_array( $curl_code, $transient_codes, true )
+            || stripos( $msg, 'timeout' ) !== false
+            || stripos( $msg, 'resolve' ) !== false;
+
+        $last = $resp;
+        if ( ! $is_transient || $i === $max ) break;
+        $log[] = "  [CONECTIVIDADE] Aguardando 1s antes da tentativa " . ( $i + 1 ) . "/{$max}...";
+        sleep( 1 );
+    }
+    return $last;
+}
+
+/**
+ * GET helper simples — retorna array decodificado ou WP_Error.
+ */
+function vit_raw_get( $url, &$log ) {
+    $raw = vit_get_with_retry( $url, $log );
+
+    if ( is_wp_error( $raw ) ) {
+        $log[] = '  ERRO CONEXÃO: ' . $raw->get_error_message();
+        return $raw;
+    }
+
+    $http  = wp_remote_retrieve_response_code( $raw );
+    $rbody = wp_remote_retrieve_body( $raw );
+    $dec   = json_decode( $rbody, true );
+
+    if ( $http !== 200 ) {
+        $msg = '';
+        if ( is_array( $dec ) && isset( $dec['message'] ) ) {
+            $msg = is_array( $dec['message'] ) ? implode( ' | ', $dec['message'] ) : (string) $dec['message'];
+        }
+        $log[] = '  HTTP ' . $http . ( $msg ? " — {$msg}" : '' );
+        return new WP_Error( 'api_http_error', "HTTP {$http}" . ( $msg ? " — {$msg}" : '' ) );
+    }
+
+    if ( json_last_error() !== JSON_ERROR_NONE ) {
+        $log[] = '  JSON inválido: ' . json_last_error_msg();
+        return new WP_Error( 'api_json_error', 'JSON inválido' );
+    }
+
+    $log[] = '  HTTP 200 OK — campos recebidos: ' . implode( ', ', array_keys( $dec ?? [] ) );
+    return $dec;
+}
+
+/**
+ * GET para /imoveis/listar — parâmetros via query string "pesquisa" em JSON.
+ */
+function vit_call_api_get( $base_url, $endpoint, $api_key, $params, &$log ) {
+    $url = rtrim( $base_url, '/' ) . $endpoint;
+    $url = add_query_arg( [
+        'key'       => $api_key,
+        'pesquisa'  => wp_json_encode( $params ),
+        'showtotal' => 1,
+    ], $url );
+
+    $log[] = 'Endpoint   : GET ' . $endpoint;
+    $log[] = 'Pesquisa   : ' . wp_json_encode( $params, JSON_UNESCAPED_UNICODE );
+
+    $response = vit_get_with_retry( $url, $log );
     return vit_handle_api_response( $response, $log );
 }
 
 /**
- * Faz a chamada para a API Vista usando POST (para /detalhes).
+ * POST para /imoveis/detalhes.
  */
-function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [], &$log ) {
+function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields, &$log ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
     $url = add_query_arg( [ 'key' => $api_key ], $url );
 
-    $log[] = "Endpoint: POST " . $endpoint;
-    $log[] = "Corpo (Payload) enviado: " . json_encode($post_fields, JSON_UNESCAPED_UNICODE);
+    $log[] = 'Endpoint   : POST ' . $endpoint;
+    $log[] = 'Payload    : ' . wp_json_encode( $post_fields, JSON_UNESCAPED_UNICODE );
 
-    $args = [
-        'method'  => 'POST', 'timeout' => 30,
+    $timeout = 45;
+    $GLOBALS['vit_force_timeout'] = $timeout;
+    $t0 = microtime( true );
+    $response = wp_remote_post( $url, [
+        'timeout' => $timeout,
         'headers' => [ 'Content-Type' => 'application/json', 'Accept' => 'application/json' ],
-        'body'    => json_encode( $post_fields ),
-    ];
-    $response = wp_remote_post( $url, $args );
+        'body'    => wp_json_encode( $post_fields ),
+    ] );
+    $elapsed_ms = (int) round( ( microtime( true ) - $t0 ) * 1000 );
+    unset( $GLOBALS['vit_force_timeout'] );
+
+    $host = parse_url( $url, PHP_URL_HOST ) ?: '-';
+    if ( is_wp_error( $response ) ) {
+        $msg  = $response->get_error_message();
+        $code = vit_parse_curl_code( $msg );
+        $log[] = sprintf( "  [CONECTIVIDADE] POST host=%s timeout_configurado=%ds | FALHOU em %dms | tipo=cURL-%d | msg=%s",
+            $host, $timeout, $elapsed_ms, $code, $msg );
+    } else {
+        $log[] = sprintf( "  [CONECTIVIDADE] POST host=%s timeout_configurado=%ds | OK em %dms",
+            $host, $timeout, $elapsed_ms );
+    }
+
     return vit_handle_api_response( $response, $log );
 }
 
-/**
- * Função unificada para tratar a resposta da API e adicionar logs.
- */
 function vit_handle_api_response( $response, &$log ) {
     if ( is_wp_error( $response ) ) {
-        $log[] = "ERRO DE CONEXÃO: " . $response->get_error_message();
+        $log[] = 'ERRO DE CONEXÃO: ' . $response->get_error_message();
         return $response;
     }
-    $body = wp_remote_retrieve_body( $response );
-    $http_code = wp_remote_retrieve_response_code( $response  );
-    
-    $log[] = "HTTP Status Code: " . $http_code;
-    $log[] = "Resposta Bruta (início ): " . substr($body, 0, 500);
+    $body      = wp_remote_retrieve_body( $response );
+    $http_code = wp_remote_retrieve_response_code( $response );
 
-    if ( $http_code !== 200  ) {
-        return new WP_Error( 'api_http_error', "A API retornou um erro HTTP {$http_code}."  );
+    $log[] = 'HTTP Status: ' . $http_code;
+    $log[] = 'Resposta   : ' . substr( $body, 0, 500 ) . ( strlen( $body ) > 500 ? ' (...truncado)' : '' );
+
+    $decoded = json_decode( $body, true );
+
+    if ( $http_code !== 200 ) {
+        // Tenta extrair a mensagem de erro estruturada da API Vista.
+        $api_msg = '';
+        if ( is_array( $decoded ) && isset( $decoded['message'] ) ) {
+            $api_msg = is_array( $decoded['message'] ) ? implode( ' | ', $decoded['message'] ) : (string) $decoded['message'];
+        }
+        $log[] = 'ERRO da API: ' . ( $api_msg ?: '(sem mensagem)' );
+        return new WP_Error( 'api_http_error', "HTTP {$http_code}" . ( $api_msg ? " — {$api_msg}" : '' ) );
     }
-    $data = json_decode( $body, true );
     if ( json_last_error() !== JSON_ERROR_NONE ) {
-        return new WP_Error( 'api_json_error', 'Falha ao decodificar o JSON da API.' );
+        return new WP_Error( 'api_json_error', 'Falha ao decodificar JSON: ' . json_last_error_msg() );
     }
-    return $data;
+    return $decoded;
 }
 
-
-// O restante do código (get_or_create_post, update_fields, process_images) permanece o mesmo.
-// ... (as funções vit_get_or_create_property_post, vit_update_property_fields, etc. continuam aqui)
+/**
+ * Procura post existente por _vista_codigo ou cria novo.
+ */
 function vit_get_or_create_property_post( $vista_code, &$log ) {
-    $args = [ 'post_type' => 'imoveis', 'post_status' => 'any', 'meta_key' => '_vista_codigo', 'meta_value' => $vista_code, 'posts_per_page' => 1, 'fields' => 'ids' ];
-    $query = new WP_Query( $args );
+    $query = new WP_Query( [
+        'post_type'      => 'imoveis',
+        'post_status'    => 'any',
+        'meta_key'       => '_vista_codigo',
+        'meta_value'     => $vista_code,
+        'posts_per_page' => 1,
+        'fields'         => 'ids',
+    ] );
+
     if ( $query->have_posts() ) {
         $post_id = $query->posts[0];
-        $log[] = "Imóvel já existe no WordPress com ID {$post_id}. Atualizando...";
+        $log[] = "Post existente localizado (ID {$post_id}). Atualizando.";
         return $post_id;
+    }
+
+    $post_id = wp_insert_post( [
+        'post_type'   => 'imoveis',
+        'post_status' => 'publish',
+        'post_title'  => 'Imóvel ' . $vista_code,
+    ] );
+    if ( is_wp_error( $post_id ) || ! $post_id ) {
+        $log[] = 'Falha ao criar post: ' . ( is_wp_error( $post_id ) ? $post_id->get_error_message() : 'erro desconhecido' );
+        return 0;
+    }
+    $log[] = "Post novo criado (ID {$post_id}).";
+    return $post_id;
+}
+
+/**
+ * Salva todos os campos do imóvel como meta e loga um a um.
+ */
+function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_origins = [] ) {
+    // Título e conteúdo
+    $title = ! empty( $data['TituloSite'] )
+        ? $data['TituloSite']
+        : trim( ( $data['Cidade'] ?? '' ) . ' - ' . ( $data['Bairro'] ?? '' ) );
+    if ( empty( trim( $title, ' -' ) ) ) $title = 'Imóvel ' . ( $data['Codigo'] ?? '' );
+
+    wp_update_post( [
+        'ID'           => $post_id,
+        'post_title'   => sanitize_text_field( $title ),
+        'post_content' => wp_kses_post( $data['DescricaoWeb'] ?? '' ),
+    ] );
+    $log[] = "[TÍTULO] definido como: \"{$title}\"";
+
+    // Mapa: meta_key WP => nome do campo na API Vista
+    $map = [
+        '_vista_codigo'   => 'Codigo',
+        'codigo'          => 'Codigo',
+        'codigo_corretor' => 'CodigoCorretor',
+        'bairro'          => 'Bairro',
+        'cidade'          => 'Cidade',
+        'uf'              => 'UF',
+        'latitude'        => 'Latitude',
+        'longitude'       => 'Longitude',
+        'status'          => 'Status',
+        'finalidade'      => 'Finalidade',
+        'categoria'       => 'Categoria',
+        'moeda'           => 'Moeda',
+        'dormitorios'     => 'Dormitorios',
+        'suites'          => 'Suites',
+        'banheiros'       => 'BanheiroSocialQtd',
+        'vagas'           => 'Vagas',
+        'area_total'      => 'AreaTotal',
+        'area_privativa'  => 'AreaPrivativa',
+        'valor_venda'     => 'ValorVenda',
+        'valor_locacao'   => 'ValorLocacao',
+        'valor_iptu'      => 'ValorIptu',
+        'valor_condominio' => 'ValorCondominio',
+    ];
+
+    foreach ( $map as $meta_key => $api_key ) {
+        $value  = $data[ $api_key ] ?? null;
+        $origin = $field_origins[ $api_key ] ?? 'desconhecido';
+
+        if ( $value === null || $value === '' || ( is_array( $value ) && empty( $value ) ) ) {
+            $log[] = sprintf( "[CAMPO] API:'%s' -> WP:'%s' | origem=%s | Valor: \"\" | - VAZIO (ignorado)", $api_key, $meta_key, $origin );
+            $counters['empty']++;
+            continue;
+        }
+        $clean   = is_scalar( $value ) ? sanitize_text_field( (string) $value ) : maybe_serialize( $value );
+        $preview = is_scalar( $value ) ? (string) $value : wp_json_encode( $value );
+        if ( mb_strlen( $preview ) > 60 ) $preview = mb_substr( $preview, 0, 60 ) . '...';
+        update_post_meta( $post_id, $meta_key, $clean );
+        $log[] = sprintf( "[CAMPO] API:'%s' -> WP:'%s' | origem=%s | Valor: \"%s\" | OK SALVO", $api_key, $meta_key, $origin, $preview );
+        $counters['saved']++;
+    }
+
+    // Mapa "latitude,longitude"
+    if ( ! empty( $data['Latitude'] ) && ! empty( $data['Longitude'] ) ) {
+        $mapa_val = $data['Latitude'] . ',' . $data['Longitude'];
+        update_post_meta( $post_id, 'mapa', $mapa_val );
+        $log[] = "[CAMPO] WP:'mapa' | Valor: \"{$mapa_val}\" | OK SALVO";
+        $counters['saved']++;
     } else {
-        $post_id = wp_insert_post( [ 'post_type' => 'imoveis', 'post_status' => 'publish', 'post_title' => 'Imóvel ' . $vista_code ] );
-        $log[] = "Imóvel não encontrado. Criando novo post com ID {$post_id}.";
-        return $post_id;
+        $log[] = "[CAMPO] WP:'mapa' | Valor: \"\" | - VAZIO (ignorado)";
+        $counters['empty']++;
+    }
+
+    // Características, Infraestrutura, Imediações
+    $feature_map = [
+        'caracteristicas' => 'Caracteristicas',
+        'infraestrutura'  => 'InfraEstrutura',
+        'imediacoes'      => 'Imediacoes',
+    ];
+    foreach ( $feature_map as $meta_key => $api_key ) {
+        $group = $data[ $api_key ] ?? null;
+        if ( empty( $group ) || ! is_array( $group ) ) {
+            $log[] = "[CARACTERISTICAS] '{$api_key}': vazio/ignorado.";
+            $counters['empty']++;
+            continue;
+        }
+        $positive = array_keys( $group, 'Sim' );
+        $total    = count( $group );
+        $pos      = count( $positive );
+        $ignored  = $total - $pos;
+
+        $log[] = sprintf( "[CARACTERISTICAS] '%s' -> Total: %d | Positivos (Sim): %d | Ignorados: %d", $api_key, $total, $pos, $ignored );
+        if ( $pos > 0 ) {
+            $log[] = sprintf( "[CARACTERISTICAS] '%s' positivos: %s", $api_key, implode( ', ', $positive ) );
+            update_post_meta( $post_id, $meta_key, implode( ', ', $positive ) );
+            update_post_meta( $post_id, "_{$meta_key}_raw", $group );
+            $counters['saved']++;
+        } else {
+            $counters['empty']++;
+        }
     }
 }
 
-function vit_update_property_fields( $post_id, $property_data, &$log ) {
-    $log[] = 'Mapeando e salvando campos...';
-    $post_title = ! empty( $property_data['TituloSite'] ) ? $property_data['TituloSite'] : trim( ($property_data['Cidade'] ?? '') . ' - ' . ($property_data['Bairro'] ?? '') );
-    wp_update_post( [ 'ID' => $post_id, 'post_title' => sanitize_text_field( $post_title ), 'post_content' => wp_kses_post( $property_data['DescricaoWeb'] ?? '' ) ] );
-    $log[] = "Título definido como: '{$post_title}'.";
-    $meta_map = [ '_vista_codigo' => 'Codigo', 'codigo' => 'Codigo', 'codigo_corretor' => 'CodigoCorretor', 'bairro' => 'Bairro', 'cidade' => 'Cidade', 'uf' => 'UF', 'latitude' => 'Latitude', 'longitude' => 'Longitude', 'status' => 'Status', 'finalidade' => 'Finalidade', 'categoria' => 'Categoria', 'moeda' => 'Moeda', 'dormitorios' => 'Dormitorios', 'suites' => 'Suites', 'banheiros' => 'BanheiroSocialQtd', 'vagas' => 'Vagas', 'area_total' => 'AreaTotal', 'area_privativa' => 'AreaPrivativa', 'valor_venda' => 'ValorVenda', 'valor_locacao' => 'ValorLocacao', 'valor_iptu' => 'ValorIptu', 'valor_condominio' => 'ValorCondominio' ];
-    foreach ( $meta_map as $meta_key => $api_key ) { if ( isset( $property_data[$api_key] ) ) update_post_meta( $post_id, $meta_key, sanitize_text_field( $property_data[$api_key] ) ); }
-    if ( ! empty( $property_data['Latitude'] ) && ! empty( $property_data['Longitude'] ) ) update_post_meta( $post_id, 'mapa', "{$property_data['Latitude']},{$property_data['Longitude']}" );
-    $feature_arrays = [ 'caracteristicas' => 'Caracteristicas', 'infraestrutura'  => 'InfraEstrutura', 'imediacoes' => 'Imediacoes' ];
-    foreach ( $feature_arrays as $meta_key => $api_key ) {
-        if ( ! empty( $property_data[$api_key] ) && is_array( $property_data[$api_key] ) ) {
-            $positive_items = array_keys( $property_data[$api_key], 'Sim' );
-            if ( ! empty( $positive_items ) ) {
-                update_post_meta( $post_id, $meta_key, implode( ', ', $positive_items ) );
-                update_post_meta( $post_id, "_{$meta_key}_raw", $property_data[$api_key] );
+/**
+ * Baixa todas as imagens do bloco Foto, define thumbnail e salva galeria em 4 metas.
+ */
+function vit_process_property_images( $post_id, $data, &$log, &$counters ) {
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+
+    $photos = $data['Foto'] ?? [];
+    if ( empty( $photos ) || ! is_array( $photos ) ) {
+        $log[] = 'Nenhuma imagem no bloco Foto.';
+        return;
+    }
+
+    // Normaliza: se for objeto associativo com chaves numéricas-string, transforma em lista
+    $photos = array_values( $photos );
+    $counters['found'] = count( $photos );
+    $log[] = 'Imagens encontradas na API: ' . $counters['found'];
+
+    if ( isset( $photos[0]['Ordem'] ) ) {
+        usort( $photos, fn( $a, $b ) => (int) ( $a['Ordem'] ?? 0 ) <=> (int) ( $b['Ordem'] ?? 0 ) );
+    }
+
+    $gallery_ids      = [];
+    $featured_id      = 0;
+    $total            = count( $photos );
+
+    foreach ( $photos as $i => $photo ) {
+        $idx  = $i + 1;
+        $url  = null;
+        $used_field = null;
+        // Ordem de preferência: tamanho grande primeiro, depois pequeno
+        foreach ( [ 'Foto', 'FotoGrande', 'URL', 'URLFoto', 'Link', 'FotoPequena', 'URLFotoPequena' ] as $field ) {
+            if ( ! empty( $photo[ $field ] ) && filter_var( $photo[ $field ], FILTER_VALIDATE_URL ) ) {
+                $url = $photo[ $field ];
+                $used_field = $field;
+                break;
             }
         }
-    }
-    $log[] = 'Campos salvos com sucesso.';
-}
+        $destaque = ( ! empty( $photo['Destaque'] ) && strtolower( $photo['Destaque'] ) === 'sim' );
 
-function vit_process_property_images( $post_id, $property_data, &$log ) {
-    require_once( ABSPATH . 'wp-admin/includes/media.php' ); require_once( ABSPATH . 'wp-admin/includes/file.php' ); require_once( ABSPATH . 'wp-admin/includes/image.php' );
-    if ( empty( $property_data['Foto'] ) || ! is_array( $property_data['Foto'] ) ) { $log[] = 'Nenhuma imagem encontrada.'; return; }
-    $photos = $property_data['Foto'];
-    $log[] = 'Encontradas ' . count( $photos ) . ' imagens na API.';
-    if ( isset( $photos[0]['Ordem'] ) ) usort( $photos, fn($a, $b) => $a['Ordem'] <=> $b['Ordem'] );
-    $gallery_ids = []; $featured_image_id = null;
-    foreach ( $photos as $photo ) {
-        $image_url = $photo['URL'] ?? $photo['URLFoto'] ?? $photo['Foto'] ?? $photo['FotoGrande'] ?? null;
-        if ( empty( $image_url ) ) continue;
-        $attachment_id = vit_sideload_image( $image_url, $post_id, get_the_title( $post_id ) );
-        if ( is_wp_error( $attachment_id ) ) { $log[] = 'ERRO ao baixar imagem ' . $image_url . ': ' . $attachment_id->get_error_message(); } else {
-            $gallery_ids[] = $attachment_id;
-            update_post_meta( $attachment_id, '_vista_image_origin_url', esc_url_raw( $image_url ) );
-            if ( ! empty( $photo['Destaque'] ) && strtolower( $photo['Destaque'] ) === 'sim' ) $featured_image_id = $attachment_id;
+        if ( empty( $url ) ) {
+            $keys_found = is_array( $photo ) ? implode( ', ', array_keys( $photo ) ) : '(não-array)';
+            $log[] = sprintf( "[IMAGEM %d/%d] URL ausente. Chaves disponíveis: %s. PULADA.", $idx, $total, $keys_found );
+            $counters['failed']++;
+            continue;
+        }
+
+        $log[] = sprintf( "[IMAGEM %d/%d] URL: %s | Campo usado: '%s' | Destaque: %s", $idx, $total, $url, $used_field, $destaque ? 'Sim' : 'Não' );
+
+        $attachment_id = vit_sideload_image( $url, $post_id, get_the_title( $post_id ) );
+        if ( is_wp_error( $attachment_id ) ) {
+            $log[] = sprintf( "[IMAGEM %d/%d] Download: FALHOU | Motivo: %s", $idx, $total, $attachment_id->get_error_message() );
+            $counters['failed']++;
+            continue;
+        }
+
+        $gallery_ids[] = $attachment_id;
+        update_post_meta( $attachment_id, '_vista_image_origin_url', esc_url_raw( $url ) );
+        $log[] = sprintf( "[IMAGEM %d/%d] Download: SUCESSO | Attachment ID: %d", $idx, $total, $attachment_id );
+        $counters['imported']++;
+
+        if ( $destaque && ! $featured_id ) {
+            $featured_id = $attachment_id;
+            $log[] = sprintf( "[IMAGEM %d/%d] -> Marcada como THUMBNAIL (Destaque=Sim)", $idx, $total );
         }
     }
-    $log[] = "Total de imagens importadas: " . count($gallery_ids) . ".";
-    if ( $featured_image_id ) set_post_thumbnail( $post_id, $featured_image_id );
-    elseif ( ! empty( $gallery_ids ) ) set_post_thumbnail( $post_id, $gallery_ids[0] );
+
+    // Se não houve destaque explícito, usa a primeira importada
+    if ( ! $featured_id && ! empty( $gallery_ids ) ) {
+        $featured_id = $gallery_ids[0];
+        $log[] = sprintf( "[THUMBNAIL] Nenhuma imagem marcada como Destaque=Sim. Usando a primeira (ID %d).", $featured_id );
+    }
+
+    if ( $featured_id ) {
+        set_post_thumbnail( $post_id, $featured_id );
+        $counters['thumbnail_set'] = true;
+        $counters['thumbnail_id']  = $featured_id;
+    }
+
     if ( ! empty( $gallery_ids ) ) {
-        update_post_meta( $post_id, '_vista_gallery_ids', implode( ',', $gallery_ids ) );
-        $log[] = "Galeria salva no meta '_vista_gallery_ids' para compatibilidade.";
+        $csv = implode( ',', $gallery_ids );
+        // galeria -> array de IDs (para plugins que leem array)
         update_post_meta( $post_id, 'galeria', $gallery_ids );
+        // galeria_ids e galeria_imagens -> CSV
+        update_post_meta( $post_id, 'galeria_ids', $csv );
+        update_post_meta( $post_id, 'galeria_imagens', $csv );
+        // _vista_gallery_ids -> retrocompatibilidade
+        update_post_meta( $post_id, '_vista_gallery_ids', $csv );
+
+        $log[] = "[GALERIA] Salvo em 4 metas: galeria (array), galeria_ids (CSV), galeria_imagens (CSV), _vista_gallery_ids (CSV).";
+        $log[] = '[GALERIA] IDs: ' . $csv;
     }
 }
 
+/**
+ * Baixa 1 imagem e cria o attachment no WP, evitando duplicatas pela URL de origem.
+ *
+ * Usa wp_remote_get() direto em vez de download_url() porque este último
+ * aplica wp_http_validate_url() (via wp_safe_remote_get), que pode recusar
+ * URLs de CDN externos e retorna "Invalid URL Provided".
+ */
 function vit_sideload_image( $file_url, $post_id, $desc ) {
-    $args = [ 'post_type' => 'attachment', 'post_status' => 'inherit', 'post_parent' => $post_id, 'meta_query' => [ [ 'key' => '_vista_image_origin_url', 'value' => esc_url_raw( $file_url ) ] ], 'posts_per_page' => 1, 'fields' => 'ids' ];
-    $existing = new WP_Query($args);
-    if ($existing->have_posts()) return $existing->posts[0];
-    $tmp = download_url( $file_url );
-    if ( is_wp_error( $tmp ) ) return $tmp;
-    preg_match( '/[^\?]+\.(jpg|jpe|jpeg|gif|png)/i', $file_url, $matches );
-    $file_array = [ 'tmp_name' => $tmp, 'name' => basename( $matches[0] ?? $file_url ) ];
-    if ( ! $file_array['name'] ) { @unlink( $file_array['tmp_name'] ); return new WP_Error( 'image_sideload_failed', 'Não foi possível determinar o nome do arquivo.' ); }
+    // Evita duplicata
+    $existing = new WP_Query( [
+        'post_type'      => 'attachment',
+        'post_status'    => 'inherit',
+        'meta_query'     => [ [ 'key' => '_vista_image_origin_url', 'value' => esc_url_raw( $file_url ) ] ],
+        'posts_per_page' => 1,
+        'fields'         => 'ids',
+    ] );
+    if ( $existing->have_posts() ) {
+        return (int) $existing->posts[0];
+    }
+
+    // Baixa via wp_remote_get (sem validação anti-SSRF que bloqueia CDNs)
+    $response = wp_remote_get( $file_url, [
+        'timeout'    => 60,
+        'sslverify'  => false,
+        'user-agent' => 'Mozilla/5.0 WordPress/vit-importer',
+    ] );
+    if ( is_wp_error( $response ) ) {
+        return $response;
+    }
+
+    $http_code = wp_remote_retrieve_response_code( $response );
+    if ( $http_code !== 200 ) {
+        return new WP_Error( 'http_' . $http_code, "HTTP {$http_code} ao baixar imagem" );
+    }
+
+    $body = wp_remote_retrieve_body( $response );
+    if ( empty( $body ) ) {
+        return new WP_Error( 'empty_body', 'Resposta vazia ao baixar imagem' );
+    }
+
+    // Escreve em arquivo temporário
+    $tmp = wp_tempnam( $file_url );
+    if ( ! $tmp ) {
+        return new WP_Error( 'tmp_failed', 'Falha ao criar arquivo temporário' );
+    }
+    if ( file_put_contents( $tmp, $body ) === false ) {
+        @unlink( $tmp );
+        return new WP_Error( 'write_failed', 'Falha ao escrever arquivo temporário' );
+    }
+
+    preg_match( '/[^\?]+\.(jpg|jpe|jpeg|gif|png|webp)/i', $file_url, $matches );
+    $filename = ! empty( $matches[0] ) ? basename( $matches[0] ) : basename( parse_url( $file_url, PHP_URL_PATH ) ?: 'imovel.jpg' );
+
+    $file_array = [ 'tmp_name' => $tmp, 'name' => $filename ?: 'imovel.jpg' ];
+
     $id = media_handle_sideload( $file_array, $post_id, $desc );
-    if ( is_wp_error( $id ) ) @unlink( $file_array['tmp_name'] );
-    return $id;
+    if ( is_wp_error( $id ) ) {
+        @unlink( $file_array['tmp_name'] );
+        return $id;
+    }
+    return (int) $id;
 }
