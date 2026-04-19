@@ -165,11 +165,21 @@ function vit_extract_candidates( $response, &$log ) {
 }
 
 /**
- * Busca detalhes tentando 6 variações de payload até encontrar a aceita por esta instância da API Vista.
+ * Busca detalhes do imóvel.
+ *
+ * Formato confirmado pelo log (variação G):
+ *   GET /imoveis/detalhes?key=K&imovel=CODE&Categoria=CAT&pesquisa={"fields":[...]}
+ *   - imovel e Categoria são params diretos na URL (NÃO dentro do pesquisa JSON)
+ *   - pesquisa=JSON contém somente "fields" (outros params como imovel/Categoria são inválidos dentro de pesquisa)
+ *   - Foto NÃO é válido no fields de /detalhes (igual ao /listar)
+ *
+ * Tentativa 1: fields=[] (vazio = retornar tudo, incluindo fotos automaticamente)
+ * Tentativa 2: fields com lista explícita sem Foto (se [] não funcionar)
  */
 function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidade, &$log ) {
     $base = rtrim( $base_url, '/' ) . '/imoveis/detalhes';
 
+    // Campos válidos em /detalhes — sem Foto (não disponível neste endpoint)
     $fields = [
         'Codigo','TituloSite','DescricaoWeb',
         'Bairro','BairroComercial','Cidade','UF','Latitude','Longitude',
@@ -177,7 +187,7 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
         'Dormitorios','Suites','BanheiroSocialQtd','Vagas',
         'AreaTotal','AreaPrivativa',
         'ValorVenda','ValorLocacao','ValorIptu','ValorCondominio',
-        'Foto','Caracteristicas','InfraEstrutura','Imediacoes',
+        'Caracteristicas','InfraEstrutura','Imediacoes',
         'CodigoCorretor','DestaqueWeb','Lancamento','FotoDestaque','ExibirNoSite',
     ];
 
@@ -185,82 +195,33 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
     if ( ! empty( $categoria ) )  $cat_arr['Categoria']  = $categoria;
     if ( ! empty( $finalidade ) ) $cat_arr['Finalidade'] = $finalidade;
 
-    // Pesquisa JSON só com fields (sem imovel/Categoria dentro — esses ficam fora)
-    $pesquisa_json        = wp_json_encode( [ 'fields' => $fields ] );
-    // Pesquisa JSON com tudo junto (imovel+Categoria+fields)
-    $pesquisa_full_json   = wp_json_encode( array_merge( [ 'imovel' => $codigo ], $cat_arr, [ 'fields' => $fields ] ) );
-
-    $url_base_key    = add_query_arg( [ 'key' => $api_key ], $base );
-    $url_imovel_cat  = add_query_arg( array_merge( [ 'key' => $api_key, 'imovel' => $codigo ], $cat_arr ), $base );
+    $url_g_empty  = add_query_arg( array_merge( [ 'key' => $api_key, 'imovel' => $codigo ], $cat_arr, [ 'pesquisa' => wp_json_encode( [ 'fields' => [] ] ) ] ), $base );
+    $url_g_fields = add_query_arg( array_merge( [ 'key' => $api_key, 'imovel' => $codigo ], $cat_arr, [ 'pesquisa' => wp_json_encode( [ 'fields' => $fields ] ) ] ), $base );
 
     $attempts = [
-        // G: *** KEY LEARNING from E: imovel e Categoria como params diretos na URL
-        //    + pesquisa={"fields":[...]} TAMBÉM na URL (igual ao padrão do /listar) — GET
+        // G1: Formato G confirmado + fields=[] vazio (= retornar tudo, incluindo Foto automaticamente)
         [
-            'label' => 'G: GET imovel+Categoria+pesquisa={fields} todos na URL',
+            'label' => 'G1: GET imovel+Categoria na URL + pesquisa={"fields":[]}',
             'method'=> 'GET',
-            'url'   => add_query_arg( array_merge(
-                [ 'key' => $api_key, 'imovel' => $codigo ],
-                $cat_arr,
-                [ 'pesquisa' => $pesquisa_json ]
-            ), $base ),
+            'url'   => $url_g_empty,
             'body'  => '',
             'ctype' => '',
         ],
-        // H: mesmo que G mas POST
+        // G2: Formato G confirmado + fields com lista explícita (sem Foto)
         [
-            'label' => 'H: POST imovel+Categoria+pesquisa={fields} na URL, body vazio',
-            'method'=> 'POST',
-            'url'   => add_query_arg( array_merge(
-                [ 'key' => $api_key, 'imovel' => $codigo ],
-                $cat_arr,
-                [ 'pesquisa' => $pesquisa_json ]
-            ), $base ),
-            'body'  => '',
-            'ctype' => '',
-        ],
-        // I: form-encoded SEPARANDO imovel/Categoria de pesquisa (não dentro do JSON)
-        [
-            'label' => 'I: form-encoded imovel+Categoria separados + pesquisa={fields}',
-            'method'=> 'POST',
-            'url'   => $url_base_key,
-            'body'  => http_build_query( array_merge(
-                [ 'imovel' => $codigo ],
-                $cat_arr,
-                [ 'pesquisa' => $pesquisa_json ]
-            ) ),
-            'ctype' => 'application/x-www-form-urlencoded',
-        ],
-        // J: imovel+Categoria na URL + pesquisa no body form-encoded
-        [
-            'label' => 'J: imovel+Categoria na URL + pesquisa={fields} form-encoded no body',
-            'method'=> 'POST',
-            'url'   => $url_imovel_cat,
-            'body'  => http_build_query( [ 'pesquisa' => $pesquisa_json ] ),
-            'ctype' => 'application/x-www-form-urlencoded',
-        ],
-        // K: GET com pesquisa completo na URL (imovel dentro do pesquisa JSON)  — era E, que passou Categoria mas errou imovel
-        //    Agora adicionamos imovel TAMBÉM como param direto na URL
-        [
-            'label' => 'K: GET imovel na URL + pesquisa={imovel+Categoria+fields} na URL',
+            'label' => 'G2: GET imovel+Categoria na URL + pesquisa={"fields":[lista sem Foto]}',
             'method'=> 'GET',
-            'url'   => add_query_arg( array_merge(
-                [ 'key' => $api_key, 'imovel' => $codigo ],
-                $cat_arr,
-                [ 'pesquisa' => $pesquisa_full_json ]
-            ), $base ),
+            'url'   => $url_g_fields,
             'body'  => '',
             'ctype' => '',
         ],
-        // L: POST body JSON com fields como objeto {campo:1} em vez de array indexado
+        // G3: Mesmo que G1 mas POST (fallback)
         [
-            'label' => 'L: POST pesquisa={fields como objeto} no body JSON',
+            'label' => 'G3: POST imovel+Categoria na URL + pesquisa={"fields":[]} body vazio',
             'method'=> 'POST',
-            'url'   => $url_imovel_cat,
-            'body'  => wp_json_encode( [
-                'pesquisa' => [ 'fields' => (object) array_fill_keys( $fields, 1 ) ],
-            ] ),
-            'ctype' => 'application/json',
+            'url'   => $url_g_empty,
+            'body'  => '',
+            'ctype' => '',
         ],
     ];
 
