@@ -54,7 +54,7 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
         $property_data = $response;
 
     } else {
-        // Busca o primeiro imóvel da lista (usa GET com JSON na URL)
+        // Busca o primeiro imóvel da lista (usa GET com JSON na URL e Header Accept)
         $log[] = 'Buscando lista de imóveis para pegar o primeiro...';
         $endpoint_list = '/imoveis/listar';
         $params = [ 'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ] ];
@@ -123,7 +123,7 @@ function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [] ) 
     $url = add_query_arg( [ 'key' => $api_key ], $url );
     $args = [
         'method'  => 'POST', 'timeout' => 30,
-        'headers' => [ 'Content-Type' => 'application/json' ],
+        'headers' => [ 'Content-Type' => 'application/json', 'Accept' => 'application/json' ],
         'body'    => json_encode( $post_fields ),
     ];
     $response = wp_remote_post( $url, $args );
@@ -136,18 +136,21 @@ function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [] ) 
 function vit_call_api_get_with_json_param( $base_url, $endpoint, $api_key, $params = [] ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
     
-    // Constrói a URL com a chave e os parâmetros codificados como JSON
     $query_args = [ 'key' => $api_key ];
     if ( ! empty( $params ) ) {
-        // A API pode esperar os parâmetros em chaves como 'filtros' ou 'paginacao'
-        // ou diretamente. Vamos enviar ambos para maximizar a chance de sucesso.
-        $query_args['filtros'] = json_encode($params);
-        $query_args['paginacao'] = json_encode($params['paginacao'] ?? []);
+        // A API espera os parâmetros de filtro e paginação em uma única chave 'pesquisa'
+        $query_args['pesquisa'] = json_encode($params);
     }
     
     $url = add_query_arg( $query_args, $url );
 
-    $args = [ 'method' => 'GET', 'timeout' => 30 ];
+    // *** CORREÇÃO APLICADA AQUI ***
+    // Adicionando o header 'Accept' que a API exigiu.
+    $args = [ 
+        'method' => 'GET', 
+        'timeout' => 30,
+        'headers' => [ 'Accept' => 'application/json' ],
+    ];
     $response = wp_remote_get( $url, $args );
     return vit_handle_api_response( $response );
 }
