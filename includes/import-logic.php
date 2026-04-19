@@ -645,6 +645,10 @@ function vit_process_property_images( $post_id, $data, &$log, &$counters ) {
 
 /**
  * Baixa 1 imagem e cria o attachment no WP, evitando duplicatas pela URL de origem.
+ *
+ * Usa wp_remote_get() direto em vez de download_url() porque este último
+ * aplica wp_http_validate_url() (via wp_safe_remote_get), que pode recusar
+ * URLs de CDN externos e retorna "Invalid URL Provided".
  */
 function vit_sideload_image( $file_url, $post_id, $desc ) {
     // Evita duplicata
@@ -659,8 +663,35 @@ function vit_sideload_image( $file_url, $post_id, $desc ) {
         return (int) $existing->posts[0];
     }
 
-    $tmp = download_url( $file_url );
-    if ( is_wp_error( $tmp ) ) return $tmp;
+    // Baixa via wp_remote_get (sem validação anti-SSRF que bloqueia CDNs)
+    $response = wp_remote_get( $file_url, [
+        'timeout'    => 60,
+        'sslverify'  => false,
+        'user-agent' => 'Mozilla/5.0 WordPress/vit-importer',
+    ] );
+    if ( is_wp_error( $response ) ) {
+        return $response;
+    }
+
+    $http_code = wp_remote_retrieve_response_code( $response );
+    if ( $http_code !== 200 ) {
+        return new WP_Error( 'http_' . $http_code, "HTTP {$http_code} ao baixar imagem" );
+    }
+
+    $body = wp_remote_retrieve_body( $response );
+    if ( empty( $body ) ) {
+        return new WP_Error( 'empty_body', 'Resposta vazia ao baixar imagem' );
+    }
+
+    // Escreve em arquivo temporário
+    $tmp = wp_tempnam( $file_url );
+    if ( ! $tmp ) {
+        return new WP_Error( 'tmp_failed', 'Falha ao criar arquivo temporário' );
+    }
+    if ( file_put_contents( $tmp, $body ) === false ) {
+        @unlink( $tmp );
+        return new WP_Error( 'write_failed', 'Falha ao escrever arquivo temporário' );
+    }
 
     preg_match( '/[^\?]+\.(jpg|jpe|jpeg|gif|png|webp)/i', $file_url, $matches );
     $filename = ! empty( $matches[0] ) ? basename( $matches[0] ) : basename( parse_url( $file_url, PHP_URL_PATH ) ?: 'imovel.jpg' );
