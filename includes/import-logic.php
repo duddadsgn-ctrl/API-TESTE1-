@@ -85,12 +85,7 @@ function vit_import_property( $api_url, $api_key ) {
     $log[] = '';
     $log[] = '--- FASE 3: buscando detalhes em /imoveis/detalhes ---';
 
-    // A API Vista exige Categoria no payload do /detalhes.
-    $details_payload = [ 'imovel' => $property_code, 'fields' => [] ];
-    if ( ! empty( $categoria ) )  $details_payload['Categoria']  = $categoria;
-    if ( ! empty( $finalidade ) ) $details_payload['Finalidade'] = $finalidade;
-
-    $details_response = vit_call_api_post( $api_url, '/imoveis/detalhes', $api_key, $details_payload, $log );
+    $details_response = vit_call_detalhes( $api_url, $api_key, $property_code, $categoria, $finalidade, $log );
 
     if ( is_wp_error( $details_response ) ) {
         $log[] = 'ERRO FINAL (detalhes): ' . $details_response->get_error_message();
@@ -167,6 +162,117 @@ function vit_extract_candidates( $response, &$log ) {
         }
     }
     return $items;
+}
+
+/**
+ * Tenta buscar detalhes do imóvel usando 4 formatos diferentes até um funcionar.
+ * A API Vista tem comportamento variável entre instâncias quanto a onde lê a Categoria.
+ */
+function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidade, &$log ) {
+    $endpoint = '/imoveis/detalhes';
+
+    $attempts = [
+        // 1) Categoria como query param na URL (mais comum em instâncias customizadas)
+        [
+            'label'  => 'Categoria na URL, imovel no body JSON',
+            'method' => 'POST',
+            'extra_query' => array_filter( [ 'Categoria' => $categoria, 'Finalidade' => $finalidade ] ),
+            'body'   => wp_json_encode( [ 'imovel' => $codigo, 'fields' => [] ] ),
+            'ctype'  => 'application/json',
+        ],
+        // 2) Tudo como query params na URL, body vazio
+        [
+            'label'  => 'imovel + Categoria na URL, body vazio',
+            'method' => 'POST',
+            'extra_query' => array_filter( [ 'imovel' => $codigo, 'Categoria' => $categoria, 'Finalidade' => $finalidade ] ),
+            'body'   => '',
+            'ctype'  => '',
+        ],
+        // 3) pesquisa wrapper no body JSON (como /listar mas via POST)
+        [
+            'label'  => 'pesquisa wrapper no body JSON',
+            'method' => 'POST',
+            'extra_query' => [],
+            'body'   => wp_json_encode( array_filter( [
+                'pesquisa' => array_filter( [ 'imovel' => $codigo, 'Categoria' => $categoria, 'Finalidade' => $finalidade, 'fields' => [] ] ),
+            ] ) ),
+            'ctype'  => 'application/json',
+        ],
+        // 4) Form-encoded com pesquisa=JSON (mesmo padrão de /listar mas POST)
+        [
+            'label'  => 'form-encoded pesquisa=JSON',
+            'method' => 'POST',
+            'extra_query' => [],
+            'body'   => http_build_query( [ 'pesquisa' => wp_json_encode( array_filter( [
+                'imovel'     => $codigo,
+                'Categoria'  => $categoria,
+                'Finalidade' => $finalidade,
+                'fields'     => [],
+            ] ) ) ] ),
+            'ctype'  => 'application/x-www-form-urlencoded',
+        ],
+    ];
+
+    $last_error = null;
+    foreach ( $attempts as $i => $attempt ) {
+        $n   = $i + 1;
+        $url = rtrim( $base_url, '/' ) . $endpoint;
+        $qargs = [ 'key' => $api_key ];
+        if ( ! empty( $attempt['extra_query'] ) ) {
+            $qargs = array_merge( $qargs, $attempt['extra_query'] );
+        }
+        $url = add_query_arg( $qargs, $url );
+
+        $log[] = sprintf( '[DETALHES tentativa %d/4] %s', $n, $attempt['label'] );
+        $log[] = '  URL query: ' . remove_query_arg( 'key', $url );
+        if ( ! empty( $attempt['body'] ) ) {
+            $log[] = '  Body: ' . substr( $attempt['body'], 0, 200 );
+        }
+
+        $headers = [ 'Accept' => 'application/json' ];
+        if ( ! empty( $attempt['ctype'] ) ) {
+            $headers['Content-Type'] = $attempt['ctype'];
+        }
+
+        $raw = wp_remote_post( $url, [
+            'timeout' => 30,
+            'headers' => $headers,
+            'body'    => $attempt['body'],
+        ] );
+
+        if ( is_wp_error( $raw ) ) {
+            $log[] = '  Resultado: ERRO DE CONEXÃO — ' . $raw->get_error_message();
+            $last_error = $raw;
+            continue;
+        }
+
+        $http_code = wp_remote_retrieve_response_code( $raw );
+        $body_text = wp_remote_retrieve_body( $raw );
+        $log[]     = '  HTTP: ' . $http_code . ' | Body: ' . substr( $body_text, 0, 300 );
+
+        if ( $http_code !== 200 ) {
+            $decoded = json_decode( $body_text, true );
+            $api_msg = '';
+            if ( is_array( $decoded ) && isset( $decoded['message'] ) ) {
+                $api_msg = is_array( $decoded['message'] ) ? implode( ' | ', $decoded['message'] ) : (string) $decoded['message'];
+            }
+            $log[]      = '  Resultado: HTTP ' . $http_code . ( $api_msg ? " — {$api_msg}" : '' );
+            $last_error = new WP_Error( 'api_http_error', "HTTP {$http_code}" . ( $api_msg ? " — {$api_msg}" : '' ) );
+            continue;
+        }
+
+        $data = json_decode( $body_text, true );
+        if ( json_last_error() !== JSON_ERROR_NONE ) {
+            $log[]      = '  Resultado: JSON inválido — ' . json_last_error_msg();
+            $last_error = new WP_Error( 'api_json_error', 'JSON inválido' );
+            continue;
+        }
+
+        $log[] = '  Resultado: SUCESSO com tentativa ' . $n . '!';
+        return $data;
+    }
+
+    return $last_error ?? new WP_Error( 'api_all_failed', 'Todas as 4 tentativas falharam.' );
 }
 
 /**
