@@ -529,14 +529,6 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         'valor_condominio' => 'ValorCondominio',
     ];
 
-    // Campos monetários: além do valor bruto, salva também *_formatado em BRL
-    $money_fields = [
-        'valor_venda'      => 'valor_venda_formatado',
-        'valor_locacao'    => 'valor_locacao_formatado',
-        'valor_iptu'       => 'valor_iptu_formatado',
-        'valor_condominio' => 'valor_condominio_formatado',
-    ];
-
     foreach ( $map as $meta_key => $api_key ) {
         $value  = $data[ $api_key ] ?? null;
         $origin = $field_origins[ $api_key ] ?? 'desconhecido';
@@ -544,11 +536,6 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         if ( $value === null || $value === '' || ( is_array( $value ) && empty( $value ) ) ) {
             $log[] = sprintf( "[CAMPO] API:'%s' -> WP:'%s' | origem=%s | Valor: \"\" | - VAZIO (ignorado)", $api_key, $meta_key, $origin );
             $counters['empty']++;
-            // Mesmo vazio, registra a tentativa de formatado para log completo
-            if ( isset( $money_fields[ $meta_key ] ) ) {
-                $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"\" | - VAZIO (ignorado)", $money_fields[ $meta_key ] );
-                $counters['empty']++;
-            }
             continue;
         }
         $clean   = is_scalar( $value ) ? sanitize_text_field( (string) $value ) : maybe_serialize( $value );
@@ -557,20 +544,6 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         update_post_meta( $post_id, $meta_key, $clean );
         $log[] = sprintf( "[CAMPO] API:'%s' -> WP:'%s' | origem=%s | Valor: \"%s\" | OK SALVO", $api_key, $meta_key, $origin, $preview );
         $counters['saved']++;
-
-        // Salva versão formatada logo em seguida, integrando ao log
-        if ( isset( $money_fields[ $meta_key ] ) ) {
-            $fmt_meta  = $money_fields[ $meta_key ];
-            $formatted = vit_format_brl( $value );
-            if ( $formatted === '' ) {
-                $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" | - zero/inválido (ignorado)", $fmt_meta, (string) $value );
-                $counters['empty']++;
-            } else {
-                update_post_meta( $post_id, $fmt_meta, $formatted );
-                $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" -> formatado=\"%s\" | OK SALVO", $fmt_meta, (string) $value, $formatted );
-                $counters['saved']++;
-            }
-        }
     }
 
     // Mapa "latitude,longitude"
@@ -611,6 +584,50 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         } else {
             $counters['empty']++;
         }
+    }
+
+    // Etapa separada: pós-processamento de valores monetários em BRL.
+    // A Vista NÃO devolve valores formatados — fazemos isso aqui no WP,
+    // a partir das metas brutas já salvas (valor_venda, valor_locacao, ...).
+    vit_apply_brl_formatting( $post_id, $log, $counters );
+}
+
+/**
+ * Pós-processamento independente: lê as metas brutas de valor já salvas
+ * e cria as metas *_formatado correspondentes (R$X.XXX.XXX).
+ * Roda separado do salvamento dos campos para deixar claro o que é
+ * formatação no lado do WP.
+ */
+function vit_apply_brl_formatting( $post_id, &$log, &$counters ) {
+    $log[] = '';
+    $log[] = '--- FORMATAÇÃO BRL (pós-processamento, calculado no WP) ---';
+
+    $money_fields = [
+        'valor_venda'      => 'valor_venda_formatado',
+        'valor_locacao'    => 'valor_locacao_formatado',
+        'valor_iptu'       => 'valor_iptu_formatado',
+        'valor_condominio' => 'valor_condominio_formatado',
+    ];
+
+    foreach ( $money_fields as $raw_meta => $fmt_meta ) {
+        $raw_value = get_post_meta( $post_id, $raw_meta, true );
+
+        if ( $raw_value === '' || $raw_value === null ) {
+            $log[] = sprintf( "[FORMATADO] WP:'%s' <- meta:'%s'=\"\" | - origem vazia (nada a formatar)", $fmt_meta, $raw_meta );
+            $counters['empty']++;
+            continue;
+        }
+
+        $formatted = vit_format_brl( $raw_value );
+        if ( $formatted === '' ) {
+            $log[] = sprintf( "[FORMATADO] WP:'%s' <- meta:'%s'=\"%s\" | - zero/inválido (ignorado)", $fmt_meta, $raw_meta, (string) $raw_value );
+            $counters['empty']++;
+            continue;
+        }
+
+        update_post_meta( $post_id, $fmt_meta, $formatted );
+        $log[] = sprintf( "[FORMATADO] WP:'%s' <- meta:'%s'=\"%s\" -> \"%s\" | OK SALVO", $fmt_meta, $raw_meta, (string) $raw_value, $formatted );
+        $counters['saved']++;
     }
 }
 
