@@ -314,10 +314,12 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
 
 /**
  * GET helper simples — retorna array decodificado ou WP_Error.
- * Faz retry automático em falhas transientes (timeout, DNS, conexão).
  */
 function vit_raw_get( $url, &$log ) {
-    $raw = vit_http_get_with_retry( $url, $log );
+    $raw = wp_remote_get( $url, [
+        'timeout' => 30,
+        'headers' => [ 'Accept' => 'application/json' ],
+    ] );
 
     if ( is_wp_error( $raw ) ) {
         $log[] = '  ERRO CONEXÃO: ' . $raw->get_error_message();
@@ -360,52 +362,11 @@ function vit_call_api_get( $base_url, $endpoint, $api_key, $params, &$log ) {
     $log[] = 'Endpoint   : GET ' . $endpoint;
     $log[] = 'Pesquisa   : ' . wp_json_encode( $params, JSON_UNESCAPED_UNICODE );
 
-    $response = vit_http_get_with_retry( $url, $log );
+    $response = wp_remote_get( $url, [
+        'timeout' => 30,
+        'headers' => [ 'Accept' => 'application/json' ],
+    ] );
     return vit_handle_api_response( $response, $log );
-}
-
-/**
- * Faz wp_remote_get com retry automático em falhas transientes.
- * Tenta 3 vezes com backoff (2s, 4s) — apenas para erros de rede
- * (timeout, DNS, conexão recusada). Erros HTTP 4xx/5xx não retentam.
- */
-function vit_http_get_with_retry( $url, &$log, $max_attempts = 3 ) {
-    $args = [
-        'timeout'    => 60,
-        'headers'    => [ 'Accept' => 'application/json' ],
-        'sslverify'  => true,
-    ];
-
-    $last = null;
-    for ( $attempt = 1; $attempt <= $max_attempts; $attempt++ ) {
-        $resp = wp_remote_get( $url, $args );
-
-        if ( ! is_wp_error( $resp ) ) {
-            if ( $attempt > 1 ) {
-                $log[] = "  Tentativa {$attempt}/{$max_attempts}: conectado.";
-            }
-            return $resp;
-        }
-
-        $last = $resp;
-        $msg  = $resp->get_error_message();
-        $is_transient = ( stripos( $msg, 'timeout' ) !== false
-            || stripos( $msg, 'cURL error 28' ) !== false
-            || stripos( $msg, 'cURL error 6' ) !== false   // DNS
-            || stripos( $msg, 'cURL error 7' ) !== false   // connect refused
-            || stripos( $msg, 'cURL error 35' ) !== false  // SSL handshake
-            || stripos( $msg, 'cURL error 56' ) !== false  // recv failure
-        );
-
-        if ( ! $is_transient || $attempt === $max_attempts ) {
-            return $resp;
-        }
-
-        $wait = pow( 2, $attempt );
-        $log[] = "  Tentativa {$attempt}/{$max_attempts} falhou ({$msg}). Aguardando {$wait}s antes de retentar...";
-        sleep( $wait );
-    }
-    return $last;
 }
 
 /**
@@ -585,50 +546,6 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
             $counters['empty']++;
         }
     }
-
-    // Etapa separada: pós-processamento de valores monetários em BRL.
-    // A Vista NÃO devolve valores formatados — fazemos isso aqui no WP,
-    // a partir das metas brutas já salvas (valor_venda, valor_locacao, ...).
-    vit_apply_brl_formatting( $post_id, $log, $counters );
-}
-
-/**
- * Pós-processamento independente: lê as metas brutas de valor já salvas
- * e cria as metas *_formatado correspondentes (R$X.XXX.XXX).
- * Roda separado do salvamento dos campos para deixar claro o que é
- * formatação no lado do WP.
- */
-function vit_apply_brl_formatting( $post_id, &$log, &$counters ) {
-    $log[] = '';
-    $log[] = '--- FORMATAÇÃO BRL (pós-processamento, calculado no WP) ---';
-
-    $money_fields = [
-        'valor_venda'      => 'valor_venda_formatado',
-        'valor_locacao'    => 'valor_locacao_formatado',
-        'valor_iptu'       => 'valor_iptu_formatado',
-        'valor_condominio' => 'valor_condominio_formatado',
-    ];
-
-    foreach ( $money_fields as $raw_meta => $fmt_meta ) {
-        $raw_value = get_post_meta( $post_id, $raw_meta, true );
-
-        if ( $raw_value === '' || $raw_value === null ) {
-            $log[] = sprintf( "[FORMATADO] WP:'%s' <- meta:'%s'=\"\" | - origem vazia (nada a formatar)", $fmt_meta, $raw_meta );
-            $counters['empty']++;
-            continue;
-        }
-
-        $formatted = vit_format_brl( $raw_value );
-        if ( $formatted === '' ) {
-            $log[] = sprintf( "[FORMATADO] WP:'%s' <- meta:'%s'=\"%s\" | - zero/inválido (ignorado)", $fmt_meta, $raw_meta, (string) $raw_value );
-            $counters['empty']++;
-            continue;
-        }
-
-        update_post_meta( $post_id, $fmt_meta, $formatted );
-        $log[] = sprintf( "[FORMATADO] WP:'%s' <- meta:'%s'=\"%s\" -> \"%s\" | OK SALVO", $fmt_meta, $raw_meta, (string) $raw_value, $formatted );
-        $counters['saved']++;
-    }
 }
 
 /**
@@ -787,34 +704,4 @@ function vit_sideload_image( $file_url, $post_id, $desc ) {
         return $id;
     }
     return (int) $id;
-}
-
-/**
- * Formata um número como moeda BRL no padrão "R$4.000.000".
- * Aceita string ou número. Retorna "" se valor for vazio, zero ou inválido.
- * Mantém centavos apenas quando existirem (ex.: 1500.50 -> "R$1.500,50").
- */
-function vit_format_brl( $value ) {
-    if ( $value === null || $value === '' ) return '';
-
-    // Normaliza: remove R$, espaços; troca vírgula decimal por ponto
-    $s = is_string( $value ) ? trim( $value ) : (string) $value;
-    $s = preg_replace( '/[^\d,.\-]/', '', $s );
-
-    // Se tem vírgula e ponto, assume formato BR (ponto = milhar, vírgula = decimal)
-    if ( strpos( $s, ',' ) !== false && strpos( $s, '.' ) !== false ) {
-        $s = str_replace( '.', '', $s );
-        $s = str_replace( ',', '.', $s );
-    } elseif ( strpos( $s, ',' ) !== false ) {
-        $s = str_replace( ',', '.', $s );
-    }
-
-    if ( ! is_numeric( $s ) ) return '';
-    $num = (float) $s;
-    if ( $num <= 0 ) return '';
-
-    // Mostra 2 casas só se houver fração; senão, inteiro
-    $has_cents = abs( $num - floor( $num ) ) > 0.0001;
-    $decimals  = $has_cents ? 2 : 0;
-    return 'R$' . number_format( $num, $decimals, ',', '.' );
 }
