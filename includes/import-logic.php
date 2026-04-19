@@ -314,12 +314,10 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
 
 /**
  * GET helper simples — retorna array decodificado ou WP_Error.
+ * Faz retry automático em falhas transientes (timeout, DNS, conexão).
  */
 function vit_raw_get( $url, &$log ) {
-    $raw = wp_remote_get( $url, [
-        'timeout' => 30,
-        'headers' => [ 'Accept' => 'application/json' ],
-    ] );
+    $raw = vit_http_get_with_retry( $url, $log );
 
     if ( is_wp_error( $raw ) ) {
         $log[] = '  ERRO CONEXÃO: ' . $raw->get_error_message();
@@ -362,11 +360,52 @@ function vit_call_api_get( $base_url, $endpoint, $api_key, $params, &$log ) {
     $log[] = 'Endpoint   : GET ' . $endpoint;
     $log[] = 'Pesquisa   : ' . wp_json_encode( $params, JSON_UNESCAPED_UNICODE );
 
-    $response = wp_remote_get( $url, [
-        'timeout' => 30,
-        'headers' => [ 'Accept' => 'application/json' ],
-    ] );
+    $response = vit_http_get_with_retry( $url, $log );
     return vit_handle_api_response( $response, $log );
+}
+
+/**
+ * Faz wp_remote_get com retry automático em falhas transientes.
+ * Tenta 3 vezes com backoff (2s, 4s) — apenas para erros de rede
+ * (timeout, DNS, conexão recusada). Erros HTTP 4xx/5xx não retentam.
+ */
+function vit_http_get_with_retry( $url, &$log, $max_attempts = 3 ) {
+    $args = [
+        'timeout'    => 60,
+        'headers'    => [ 'Accept' => 'application/json' ],
+        'sslverify'  => true,
+    ];
+
+    $last = null;
+    for ( $attempt = 1; $attempt <= $max_attempts; $attempt++ ) {
+        $resp = wp_remote_get( $url, $args );
+
+        if ( ! is_wp_error( $resp ) ) {
+            if ( $attempt > 1 ) {
+                $log[] = "  Tentativa {$attempt}/{$max_attempts}: conectado.";
+            }
+            return $resp;
+        }
+
+        $last = $resp;
+        $msg  = $resp->get_error_message();
+        $is_transient = ( stripos( $msg, 'timeout' ) !== false
+            || stripos( $msg, 'cURL error 28' ) !== false
+            || stripos( $msg, 'cURL error 6' ) !== false   // DNS
+            || stripos( $msg, 'cURL error 7' ) !== false   // connect refused
+            || stripos( $msg, 'cURL error 35' ) !== false  // SSL handshake
+            || stripos( $msg, 'cURL error 56' ) !== false  // recv failure
+        );
+
+        if ( ! $is_transient || $attempt === $max_attempts ) {
+            return $resp;
+        }
+
+        $wait = pow( 2, $attempt );
+        $log[] = "  Tentativa {$attempt}/{$max_attempts} falhou ({$msg}). Aguardando {$wait}s antes de retentar...";
+        sleep( $wait );
+    }
+    return $last;
 }
 
 /**
@@ -490,6 +529,14 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         'valor_condominio' => 'ValorCondominio',
     ];
 
+    // Campos monetários: além do valor bruto, salva também *_formatado em BRL
+    $money_fields = [
+        'valor_venda'      => 'valor_venda_formatado',
+        'valor_locacao'    => 'valor_locacao_formatado',
+        'valor_iptu'       => 'valor_iptu_formatado',
+        'valor_condominio' => 'valor_condominio_formatado',
+    ];
+
     foreach ( $map as $meta_key => $api_key ) {
         $value  = $data[ $api_key ] ?? null;
         $origin = $field_origins[ $api_key ] ?? 'desconhecido';
@@ -497,6 +544,11 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         if ( $value === null || $value === '' || ( is_array( $value ) && empty( $value ) ) ) {
             $log[] = sprintf( "[CAMPO] API:'%s' -> WP:'%s' | origem=%s | Valor: \"\" | - VAZIO (ignorado)", $api_key, $meta_key, $origin );
             $counters['empty']++;
+            // Mesmo vazio, registra a tentativa de formatado para log completo
+            if ( isset( $money_fields[ $meta_key ] ) ) {
+                $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"\" | - VAZIO (ignorado)", $money_fields[ $meta_key ] );
+                $counters['empty']++;
+            }
             continue;
         }
         $clean   = is_scalar( $value ) ? sanitize_text_field( (string) $value ) : maybe_serialize( $value );
@@ -505,6 +557,20 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         update_post_meta( $post_id, $meta_key, $clean );
         $log[] = sprintf( "[CAMPO] API:'%s' -> WP:'%s' | origem=%s | Valor: \"%s\" | OK SALVO", $api_key, $meta_key, $origin, $preview );
         $counters['saved']++;
+
+        // Salva versão formatada logo em seguida, integrando ao log
+        if ( isset( $money_fields[ $meta_key ] ) ) {
+            $fmt_meta  = $money_fields[ $meta_key ];
+            $formatted = vit_format_brl( $value );
+            if ( $formatted === '' ) {
+                $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" | - zero/inválido (ignorado)", $fmt_meta, (string) $value );
+                $counters['empty']++;
+            } else {
+                update_post_meta( $post_id, $fmt_meta, $formatted );
+                $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" -> formatado=\"%s\" | OK SALVO", $fmt_meta, (string) $value, $formatted );
+                $counters['saved']++;
+            }
+        }
     }
 
     // Mapa "latitude,longitude"
@@ -516,26 +582,6 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
     } else {
         $log[] = "[CAMPO] WP:'mapa' | Valor: \"\" | - VAZIO (ignorado)";
         $counters['empty']++;
-    }
-
-    // Valores monetários formatados em BRL (ex.: 4000000 -> "R$4.000.000")
-    $money_map = [
-        'valor_venda_formatado'      => 'ValorVenda',
-        'valor_locacao_formatado'    => 'ValorLocacao',
-        'valor_iptu_formatado'       => 'ValorIptu',
-        'valor_condominio_formatado' => 'ValorCondominio',
-    ];
-    foreach ( $money_map as $meta_key => $api_key ) {
-        $raw = $data[ $api_key ] ?? '';
-        $formatted = vit_format_brl( $raw );
-        if ( $formatted === '' ) {
-            $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" | - VAZIO/zero (ignorado)", $meta_key, (string) $raw );
-            $counters['empty']++;
-            continue;
-        }
-        update_post_meta( $post_id, $meta_key, $formatted );
-        $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" -> formatado=\"%s\" | OK SALVO", $meta_key, (string) $raw, $formatted );
-        $counters['saved']++;
     }
 
     // Características, Infraestrutura, Imediações
