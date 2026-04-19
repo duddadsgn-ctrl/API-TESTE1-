@@ -63,56 +63,34 @@ function vit_import_property( $api_url, $api_key ) {
         return [ 'status' => 'error', 'log' => $log ];
     }
 
-    // ============ FASE 2: pontuar e escolher o melhor ============
+    // ============ FASE 2: pegar o primeiro imóvel disponível ============
     $log[] = '';
-    $log[] = '--- FASE 2: pontuando candidatos ---';
-    $log[] = 'Total de candidatos recebidos: ' . count( $candidates );
+    $log[] = '--- FASE 2: selecionando imóvel ---';
+    $log[] = 'Total de imóveis recebidos: ' . count( $candidates );
 
-    // Pontuação baseada nos campos disponíveis em /listar (Foto só aparece em /detalhes).
-    $scored = [];
-    foreach ( $candidates as $item ) {
-        $score = 0;
-        if ( ! empty( $item['TituloSite'] ) )  $score += 3;
-        if ( ! empty( $item['Dormitorios'] ) ) $score += 2;
-        if ( ! empty( $item['Cidade'] ) )      $score += 1;
-        if ( ! empty( $item['Bairro'] ) )      $score += 1;
-        if ( ! empty( $item['Status'] ) )      $score += 1;
-        if ( ! empty( $item['Categoria'] ) )   $score += 1;
+    $chosen       = $candidates[0];
+    $property_code = $chosen['Codigo'] ?? '';
+    $categoria     = $chosen['Categoria'] ?? '';
+    $finalidade    = $chosen['Finalidade'] ?? '';
 
-        $codigo = $item['Codigo'] ?? '(sem código)';
-        $scored[] = [ 'codigo' => $codigo, 'score' => $score, 'item' => $item ];
-        $log[] = sprintf(
-            '  Candidato %s | score=%d | Categoria=%s | Status=%s | Cidade=%s | Dormitórios=%s',
-            $codigo,
-            $score,
-            $item['Categoria']   ?? '-',
-            $item['Status']      ?? '-',
-            $item['Cidade']      ?? '-',
-            $item['Dormitorios'] ?? '-'
-        );
-    }
-
-    usort( $scored, fn( $a, $b ) => $b['score'] <=> $a['score'] );
-    $top_score = $scored[0]['score'];
-    $top = array_values( array_filter( $scored, fn( $s ) => $s['score'] === $top_score ) );
-    $chosen = $top[ array_rand( $top ) ];
-    $property_code = $chosen['codigo'];
-
-    $log[] = '';
     $log[] = sprintf(
-        'IMÓVEL ESCOLHIDO: código=%s | score=%d | (empates=%d)',
-        $property_code, $chosen['score'], count( $top )
+        'Imóvel selecionado: código=%s | Categoria=%s | Status=%s | Cidade=%s',
+        $property_code,
+        $categoria ?: '-',
+        $chosen['Status']      ?? '-',
+        $chosen['Cidade']      ?? '-'
     );
-    $log[] = 'Motivo: maior pontuação entre os 20 candidatos (campos e imagens preenchidos).';
 
     // ============ FASE 3: buscar detalhes completos ============
     $log[] = '';
     $log[] = '--- FASE 3: buscando detalhes em /imoveis/detalhes ---';
 
-    $details_response = vit_call_api_post( $api_url, '/imoveis/detalhes', $api_key, [
-        'imovel' => $property_code,
-        'fields' => [],
-    ], $log );
+    // A API Vista exige Categoria no payload do /detalhes.
+    $details_payload = [ 'imovel' => $property_code, 'fields' => [] ];
+    if ( ! empty( $categoria ) )  $details_payload['Categoria']  = $categoria;
+    if ( ! empty( $finalidade ) ) $details_payload['Finalidade'] = $finalidade;
+
+    $details_response = vit_call_api_post( $api_url, '/imoveis/detalhes', $api_key, $details_payload, $log );
 
     if ( is_wp_error( $details_response ) ) {
         $log[] = 'ERRO FINAL (detalhes): ' . $details_response->get_error_message();
