@@ -313,42 +313,80 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
 }
 
 /**
- * Wrapper de GET com retry + log de conectividade.
- * - 3 tentativas, timeout 20s cada (máx ~62s total, não trava o browser)
- * - Aguarda 1s entre tentativas apenas para erros transientes de rede
- * - Loga: nº tentativa, tempo decorrido, tipo de erro
+ * Força CURLOPT_CONNECTTIMEOUT e CURLOPT_TIMEOUT nas requisições do plugin.
+ * Alguns hosts/plugins filtram http_request_args e reduzem o timeout para
+ * 10s — este hook roda DEPOIS disso e sobrescreve direto no cURL handle.
+ * Ativo apenas durante nossas chamadas (via flag global).
+ */
+function vit_force_curl_timeout( $handle, $r, $url ) {
+    if ( empty( $GLOBALS['vit_force_timeout'] ) ) return;
+    $t = (int) $GLOBALS['vit_force_timeout'];
+    curl_setopt( $handle, CURLOPT_CONNECTTIMEOUT, $t );
+    curl_setopt( $handle, CURLOPT_TIMEOUT, $t );
+}
+add_action( 'http_api_curl', 'vit_force_curl_timeout', 9999, 3 );
+
+/**
+ * Descobre o código de erro cURL (ex.: 28) a partir de uma mensagem WP_Error.
+ */
+function vit_parse_curl_code( $msg ) {
+    if ( preg_match( '/cURL error (\d+)/i', $msg, $m ) ) {
+        return (int) $m[1];
+    }
+    return 0;
+}
+
+/**
+ * Wrapper de GET com retry + log completo de conectividade.
+ * - Força timeout no cURL handle (não pode ser filtrado por host)
+ * - 3 tentativas, log de: timeout configurado, endpoint, tempo real, erro
  */
 function vit_get_with_retry( $url, &$log, $timeout = 45, $max = 3 ) {
     $transient_codes = [ 28, 6, 7, 35, 56 ]; // timeout, DNS, conn refused, SSL, recv
 
+    $host = parse_url( $url, PHP_URL_HOST ) ?: '(sem host)';
+    $path = parse_url( $url, PHP_URL_PATH ) ?: '/';
+    $log[] = sprintf( "  [CONECTIVIDADE] host=%s path=%s timeout_configurado=%ds tentativas_max=%d",
+        $host, $path, $timeout, $max );
+
     $last = null;
     for ( $i = 1; $i <= $max; $i++ ) {
+        $GLOBALS['vit_force_timeout'] = $timeout;
         $t0   = microtime( true );
         $resp = wp_remote_get( $url, [
-            'timeout' => $timeout,
-            'headers' => [ 'Accept' => 'application/json' ],
+            'timeout'     => $timeout,
+            'redirection' => 5,
+            'headers'     => [ 'Accept' => 'application/json' ],
         ] );
-        $elapsed = round( ( microtime( true ) - $t0 ) * 1000 );
+        $elapsed_ms = (int) round( ( microtime( true ) - $t0 ) * 1000 );
+        unset( $GLOBALS['vit_force_timeout'] );
 
         if ( ! is_wp_error( $resp ) ) {
-            if ( $i > 1 ) {
-                $log[] = "  [CONECTIVIDADE] Tentativa {$i}/{$max}: OK em {$elapsed}ms.";
-            }
+            $http = wp_remote_retrieve_response_code( $resp );
+            $log[] = sprintf( "  [CONECTIVIDADE] Tentativa %d/%d: OK em %dms (HTTP %s)", $i, $max, $elapsed_ms, $http );
             return $resp;
         }
 
-        $msg  = $resp->get_error_message();
-        $code = (int) filter_var( $msg, FILTER_SANITIZE_NUMBER_INT );
-        $log[] = "  [CONECTIVIDADE] Tentativa {$i}/{$max}: FALHOU em {$elapsed}ms — {$msg}";
+        $msg       = $resp->get_error_message();
+        $curl_code = vit_parse_curl_code( $msg );
+        $tipo      = $curl_code ? "cURL-{$curl_code}" : 'wp_error';
+        $log[] = sprintf( "  [CONECTIVIDADE] Tentativa %d/%d: FALHOU em %dms | tipo=%s | msg=%s",
+            $i, $max, $elapsed_ms, $tipo, $msg );
 
-        $is_transient = in_array( $code, $transient_codes, true )
+        // Se elapsed está muito abaixo do timeout, algo está cortando
+        if ( $curl_code === 28 && $elapsed_ms < ( $timeout * 1000 - 2000 ) ) {
+            $log[] = sprintf(
+                "  [CONECTIVIDADE] ATENÇÃO: timeout ocorreu em %dms mas o configurado era %ds (%dms). Host/firewall cortando antes.",
+                $elapsed_ms, $timeout, $timeout * 1000
+            );
+        }
+
+        $is_transient = in_array( $curl_code, $transient_codes, true )
             || stripos( $msg, 'timeout' ) !== false
             || stripos( $msg, 'resolve' ) !== false;
 
         $last = $resp;
-        if ( ! $is_transient || $i === $max ) {
-            break;
-        }
+        if ( ! $is_transient || $i === $max ) break;
         $log[] = "  [CONECTIVIDADE] Aguardando 1s antes da tentativa " . ( $i + 1 ) . "/{$max}...";
         sleep( 1 );
     }
@@ -416,11 +454,28 @@ function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields, &$log 
     $log[] = 'Endpoint   : POST ' . $endpoint;
     $log[] = 'Payload    : ' . wp_json_encode( $post_fields, JSON_UNESCAPED_UNICODE );
 
+    $timeout = 45;
+    $GLOBALS['vit_force_timeout'] = $timeout;
+    $t0 = microtime( true );
     $response = wp_remote_post( $url, [
-        'timeout' => 30,
+        'timeout' => $timeout,
         'headers' => [ 'Content-Type' => 'application/json', 'Accept' => 'application/json' ],
         'body'    => wp_json_encode( $post_fields ),
     ] );
+    $elapsed_ms = (int) round( ( microtime( true ) - $t0 ) * 1000 );
+    unset( $GLOBALS['vit_force_timeout'] );
+
+    $host = parse_url( $url, PHP_URL_HOST ) ?: '-';
+    if ( is_wp_error( $response ) ) {
+        $msg  = $response->get_error_message();
+        $code = vit_parse_curl_code( $msg );
+        $log[] = sprintf( "  [CONECTIVIDADE] POST host=%s timeout_configurado=%ds | FALHOU em %dms | tipo=cURL-%d | msg=%s",
+            $host, $timeout, $elapsed_ms, $code, $msg );
+    } else {
+        $log[] = sprintf( "  [CONECTIVIDADE] POST host=%s timeout_configurado=%ds | OK em %dms",
+            $host, $timeout, $elapsed_ms );
+    }
+
     return vit_handle_api_response( $response, $log );
 }
 
