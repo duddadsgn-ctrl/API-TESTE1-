@@ -70,8 +70,8 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
         // Busca o primeiro imóvel da lista e depois seus detalhes
         $log[] = 'Buscando lista de imóveis para pegar o primeiro...';
         $endpoint_list = '/imoveis/listar';
-        $query_params_list = [ 'limit' => 1 ];
-        $response_list = vit_call_api( $api_url, $endpoint_list, $api_key, $query_params_list );
+        $query_params_list = [ 'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ] ];
+        $response_list = vit_call_api( $api_url, $endpoint_list, $api_key, [], $query_params_list );
 
         if ( is_wp_error( $response_list ) ) {
             $log[] = 'ERRO: ' . $response_list->get_error_message();
@@ -133,27 +133,38 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
 }
 
 /**
- * Faz a chamada para a API Vista.
+ * Faz a chamada para a API Vista usando POST.
  *
  * @param string $base_url      URL base da API.
  * @param string $endpoint      Endpoint a ser chamado.
  * @param string $api_key       Chave da API.
- * @param array  $query_params  Parâmetros da query.
+ * @param array  $query_params  Parâmetros da query (para detalhes).
+ * @param array  $post_fields   Campos a serem enviados no corpo do POST (para listar).
  * @return array|WP_Error       Corpo da resposta decodificado ou um erro.
  */
-function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [] ) {
+function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [], $post_fields = [] ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
-    $url = add_query_arg( $query_params, $url );
+    
+    // Adiciona a chave da API aos parâmetros da URL, que é um método comum
+    $url = add_query_arg( [ 'key' => $api_key ], $url );
 
-    $headers = [
+    // Adiciona outros parâmetros de query, como o código do imóvel
+    if ( ! empty( $query_params ) ) {
+        $url = add_query_arg( $query_params, $url );
+    }
+
+    $body = ! empty( $post_fields ) ? json_encode( $post_fields ) : '';
+
+    $args = [
+        'method'  => 'POST',
+        'timeout' => 30,
         'headers' => [
-            'Accept'        => 'application/json',
-            'chave'         => $api_key,
+            'Content-Type' => 'application/json',
         ],
-        'timeout' => 30, // 30 segundos de timeout
+        'body'    => $body,
     ];
 
-    $response = wp_remote_get( $url, $headers );
+    $response = wp_remote_post( $url, $args );
 
     if ( is_wp_error( $response ) ) {
         return new WP_Error( 'api_connection_error', 'Falha ao conectar na API: ' . $response->get_error_message() );
@@ -163,7 +174,7 @@ function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [] ) {
     $http_code = wp_remote_retrieve_response_code( $response  );
 
     if ( $http_code !== 200  ) {
-        return new WP_Error( 'api_http_error', "API retornou um erro HTTP {$http_code}. Resposta: " . substr($body, 0, 200 ) );
+        return new WP_Error( 'api_http_error', "API retornou um erro HTTP {$http_code}. Resposta: " . substr($body, 0, 300 ) );
     }
 
     $data = json_decode( $body, true );
@@ -174,6 +185,10 @@ function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [] ) {
 
     return $data;
 }
+
+
+// O restante do arquivo (as funções vit_get_or_create_property_post, vit_update_property_fields, vit_process_property_images, vit_sideload_image) permanece exatamente o mesmo.
+// Cole esta nova versão da função vit_call_api e as que a precedem, substituindo as antigas.
 
 /**
  * Procura por um imóvel existente pelo _vista_codigo. Se não encontrar, cria um novo.
@@ -312,7 +327,6 @@ function vit_update_property_fields( $post_id, $property_data, &$log ) {
  * @param array &$log           Array de logs.
  */
 function vit_process_property_images( $post_id, $property_data, &$log ) {
-    // *** CORREÇÃO APLICADA AQUI ***
     // Carrega os arquivos necessários para o upload de imagens apenas quando esta função for chamada.
     require_once( ABSPATH . 'wp-admin/includes/media.php' );
     require_once( ABSPATH . 'wp-admin/includes/file.php' );
