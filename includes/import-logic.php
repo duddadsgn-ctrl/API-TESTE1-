@@ -70,8 +70,10 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
         // Busca o primeiro imóvel da lista e depois seus detalhes
         $log[] = 'Buscando lista de imóveis para pegar o primeiro...';
         $endpoint_list = '/imoveis/listar';
-        $query_params_list = [ 'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ] ];
-        $response_list = vit_call_api( $api_url, $endpoint_list, $api_key, [], $query_params_list );
+        // A API da Vista usa um array 'paginacao' dentro do corpo da requisição para limitar os resultados.
+        // Como estamos usando GET, vamos tentar passar como parâmetro de URL.
+        $query_params_list = [ 'showtotal' => 1, 'limit' => 1 ];
+        $response_list = vit_call_api( $api_url, $endpoint_list, $api_key, $query_params_list );
 
         if ( is_wp_error( $response_list ) ) {
             $log[] = 'ERRO: ' . $response_list->get_error_message();
@@ -83,6 +85,11 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
             return [ 'status' => 'error', 'log' => $log ];
         }
         
+        // Remove o item 'total' se ele existir na resposta
+        if (isset($response_list['total'])) {
+            unset($response_list['total']);
+        }
+
         // Pega o código do primeiro imóvel da lista
         $first_property_key = array_key_first( $response_list );
         $property_code = $first_property_key;
@@ -126,6 +133,7 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
     $log[] = 'ID do Post: ' . $post_id;
     $log[] = 'Código do Imóvel: ' . $property_data['Codigo'];
     $log[] = 'Título: ' . get_the_title( $post_id );
+    $log[] = 'Link para Editar: ' . get_edit_post_link( $post_id );
     $log[] = '---------------------------------';
     $log[] = 'Importação concluída!';
 
@@ -133,38 +141,30 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
 }
 
 /**
- * Faz a chamada para a API Vista usando POST.
+ * Faz a chamada para a API Vista usando GET e com a chave na URL.
  *
  * @param string $base_url      URL base da API.
  * @param string $endpoint      Endpoint a ser chamado.
  * @param string $api_key       Chave da API.
- * @param array  $query_params  Parâmetros da query (para detalhes).
- * @param array  $post_fields   Campos a serem enviados no corpo do POST (para listar).
+ * @param array  $query_params  Parâmetros da query.
  * @return array|WP_Error       Corpo da resposta decodificado ou um erro.
  */
-function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [], $post_fields = [] ) {
+function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [] ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
-    
-    // Adiciona a chave da API aos parâmetros da URL, que é um método comum
-    $url = add_query_arg( [ 'key' => $api_key ], $url );
 
-    // Adiciona outros parâmetros de query, como o código do imóvel
-    if ( ! empty( $query_params ) ) {
-        $url = add_query_arg( $query_params, $url );
-    }
-
-    $body = ! empty( $post_fields ) ? json_encode( $post_fields ) : '';
+    // Adiciona a chave da API e os outros parâmetros na URL da requisição.
+    $all_params = array_merge( [ 'key' => $api_key ], $query_params );
+    $url = add_query_arg( $all_params, $url );
 
     $args = [
-        'method'  => 'POST',
+        'method'  => 'GET',
         'timeout' => 30,
         'headers' => [
-            'Content-Type' => 'application/json',
+            'Accept' => 'application/json',
         ],
-        'body'    => $body,
     ];
 
-    $response = wp_remote_post( $url, $args );
+    $response = wp_remote_get( $url, $args );
 
     if ( is_wp_error( $response ) ) {
         return new WP_Error( 'api_connection_error', 'Falha ao conectar na API: ' . $response->get_error_message() );
@@ -172,6 +172,10 @@ function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [], $post
 
     $body = wp_remote_retrieve_body( $response );
     $http_code = wp_remote_retrieve_response_code( $response  );
+
+    if ( $http_code === 401  ) {
+        return new WP_Error( 'api_auth_error', "API retornou erro 401 (Não Autorizado). Verifique se a Chave API está correta e se não há bloqueio de IP/domínio." );
+    }
 
     if ( $http_code !== 200  ) {
         return new WP_Error( 'api_http_error', "API retornou um erro HTTP {$http_code}. Resposta: " . substr($body, 0, 300 ) );
@@ -185,10 +189,6 @@ function vit_call_api( $base_url, $endpoint, $api_key, $query_params = [], $post
 
     return $data;
 }
-
-
-// O restante do arquivo (as funções vit_get_or_create_property_post, vit_update_property_fields, vit_process_property_images, vit_sideload_image) permanece exatamente o mesmo.
-// Cole esta nova versão da função vit_call_api e as que a precedem, substituindo as antigas.
 
 /**
  * Procura por um imóvel existente pelo _vista_codigo. Se não encontrar, cria um novo.
@@ -396,18 +396,15 @@ function vit_process_property_images( $post_id, $property_data, &$log ) {
 
     // Salva a galeria em múltiplos formatos
     if ( ! empty( $gallery_ids ) ) {
-        // Formato 1: Array de IDs (serializado pelo WordPress)
-        update_post_meta( $post_id, 'galeria', $gallery_ids );
-        
-        // Formato 2: String com IDs separados por vírgula (CSV)
-        update_post_meta( $post_id, 'galeria_ids', implode( ',', $gallery_ids ) );
-        
-        // Formato 3: Array de IDs simples (para compatibilidade)
-        update_post_meta( $post_id, 'galeria_imagens', $gallery_ids );
+        // *** CORREÇÃO APLICADA AQUI ***
+        // Formato 1: Padrão do plugin de referência (compatibilidade com JetEngine/Elementor)
+        update_post_meta( $post_id, '_vista_gallery_ids', implode( ',', $gallery_ids ) );
+        $log[] = "Galeria salva no meta '_vista_gallery_ids' como string CSV para compatibilidade.";
 
-        $log[] = "Galeria salva nos metas 'galeria', 'galeria_ids' e 'galeria_imagens'.";
-        $log[] = "-> 'galeria' e 'galeria_imagens' são salvas como um array PHP, útil para desenvolvedores que usam get_post_meta() diretamente.";
-        $log[] = "-> 'galeria_ids' é salva como uma string (ex: '101,102,103'), útil para compatibilidade com plugins de galeria ou shortcodes que esperam uma lista de IDs.";
+        // Formatos 2 e 3: Mantidos para depuração e flexibilidade, conforme solicitado.
+        update_post_meta( $post_id, 'galeria', $gallery_ids );
+        update_post_meta( $post_id, 'galeria_imagens', $gallery_ids );
+        $log[] = "Galerias de depuração salvas nos metas 'galeria' (array) e 'galeria_imagens' (array).";
     }
 }
 
