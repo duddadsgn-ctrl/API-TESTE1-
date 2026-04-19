@@ -60,38 +60,34 @@ function vit_import_property( $api_url, $api_key, $property_code = '', $api_filt
         $log[] = "Buscando detalhes do imóvel com código: {$property_code}.";
         $endpoint = '/imoveis/detalhes';
         $post_fields = [ 'imovel' => $property_code, 'fields' => [] ];
-        $response = vit_call_api_post( $api_url, $endpoint, $api_key, $post_fields );
+        $response = vit_call_api_post( $api_url, $endpoint, $api_key, $post_fields, $log );
         
         if ( is_wp_error( $response ) ) {
-            $log[] = 'ERRO: ' . $response->get_error_message();
+            $log[] = 'ERRO FINAL: ' . $response->get_error_message();
             return [ 'status' => 'error', 'log' => $log ];
         }
         $property_data = $response;
 
     } else {
-        // Se nenhum código é fornecido, busca na lista usando os filtros obrigatórios.
+        // Se nenhum código é fornecido, busca na lista usando GET com filtros.
         $log[] = 'Buscando lista de imóveis para pegar o primeiro...';
         $endpoint_list = '/imoveis/listar';
         
-        // Monta o corpo da requisição para /listar
-        $list_body = [
-            'fields'    => [ 'Codigo' ], // Pedimos apenas o código na listagem para otimizar
+        // Monta os parâmetros para a chamada GET
+        $list_params = [
             'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ]
         ];
         
-        // Adiciona os filtros obrigatórios
+        // Adiciona os filtros obrigatórios diretamente no corpo dos parâmetros
         if ( ! empty( $api_filters ) ) {
-            $list_body['filtro'] = $api_filters;
+            $list_params = array_merge($list_params, $api_filters);
         }
 
-        $log[] = "Endpoint: " . $endpoint_list;
-        $log[] = "Filtros enviados: " . json_encode($list_body, JSON_PRETTY_PRINT);
-
-        // A chamada para /listar é via POST, conforme a documentação.
-        $response_list = vit_call_api_post( $api_url, $endpoint_list, $api_key, $list_body );
+        // A chamada para /listar é via GET, com os parâmetros enviados como um JSON na URL.
+        $response_list = vit_call_api_get( $api_url, $endpoint_list, $api_key, $list_params, $log );
 
         if ( is_wp_error( $response_list ) ) {
-            $log[] = 'ERRO: ' . $response_list->get_error_message();
+            $log[] = 'ERRO FINAL: ' . $response_list->get_error_message();
             return [ 'status' => 'error', 'log' => $log ];
         }
 
@@ -101,23 +97,22 @@ function vit_import_property( $api_url, $api_key, $property_code = '', $api_filt
             return [ 'status' => 'error', 'log' => $log ];
         }
         
-        if (isset($response_list['total'])) unset($response_list['total']);
-
-        $first_property_key = array_key_first( $response_list );
-        $property_code = $first_property_key;
+        // Forma robusta de pegar o primeiro imóvel e seu código
+        $first_property_item = reset($response_list); // Pega o primeiro elemento do array
         
-        if ( empty( $property_code ) ) {
-            $log[] = 'ERRO: Nenhum imóvel encontrado com os filtros fornecidos.';
+        if ( empty( $first_property_item ) || ! isset( $first_property_item['Codigo'] ) ) {
+            $log[] = 'ERRO: Nenhum imóvel encontrado com os filtros fornecidos ou a resposta não contém um código de imóvel.';
             return [ 'status' => 'error', 'log' => $log ];
         }
+        $property_code = $first_property_item['Codigo'];
 
         $log[] = "Imóvel encontrado na lista com código: {$property_code}. Buscando detalhes completos...";
         $endpoint_details = '/imoveis/detalhes';
         $post_fields_details = [ 'imovel' => $property_code, 'fields' => [] ];
-        $response_details = vit_call_api_post( $api_url, $endpoint_details, $api_key, $post_fields_details );
+        $response_details = vit_call_api_post( $api_url, $endpoint_details, $api_key, $post_fields_details, $log );
 
         if ( is_wp_error( $response_details ) ) {
-            $log[] = 'ERRO: ' . $response_details->get_error_message();
+            $log[] = 'ERRO FINAL: ' . $response_details->get_error_message();
             return [ 'status' => 'error', 'log' => $log ];
         }
         $property_data = $response_details;
@@ -147,29 +142,71 @@ function vit_import_property( $api_url, $api_key, $property_code = '', $api_filt
 }
 
 /**
- * Função unificada para chamar a API Vista usando POST.
+ * Faz a chamada para a API Vista usando GET (para /listar).
+ * Os parâmetros são enviados como uma string JSON em um parâmetro 'pesquisa'.
  */
-function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [] ) {
+function vit_call_api_get( $base_url, $endpoint, $api_key, $params = [], &$log ) {
+    $url = rtrim( $base_url, '/' ) . $endpoint;
+    
+    $query_args = [ 'key' => $api_key ];
+    if ( ! empty( $params ) ) {
+        $query_args['pesquisa'] = json_encode($params);
+    }
+    
+    $url = add_query_arg( $query_args, $url );
+
+    $log[] = "Endpoint: GET " . $endpoint;
+    $log[] = "URL da Requisição (sem a chave): " . remove_query_arg('key', $url);
+    $log[] = "Parâmetros enviados em 'pesquisa': " . json_encode($params, JSON_UNESCAPED_UNICODE);
+
+    $args = [ 
+        'method' => 'GET', 
+        'timeout' => 30,
+        'headers' => [ 'Accept' => 'application/json' ],
+    ];
+    $response = wp_remote_get( $url, $args );
+    return vit_handle_api_response( $response, $log );
+}
+
+/**
+ * Faz a chamada para a API Vista usando POST (para /detalhes).
+ */
+function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [], &$log ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
     $url = add_query_arg( [ 'key' => $api_key ], $url );
+
+    $log[] = "Endpoint: POST " . $endpoint;
+    $log[] = "Corpo (Payload) enviado: " . json_encode($post_fields, JSON_UNESCAPED_UNICODE);
+
     $args = [
         'method'  => 'POST', 'timeout' => 30,
         'headers' => [ 'Content-Type' => 'application/json', 'Accept' => 'application/json' ],
         'body'    => json_encode( $post_fields ),
     ];
     $response = wp_remote_post( $url, $args );
-    
+    return vit_handle_api_response( $response, $log );
+}
+
+/**
+ * Função unificada para tratar a resposta da API e adicionar logs.
+ */
+function vit_handle_api_response( $response, &$log ) {
     if ( is_wp_error( $response ) ) {
-        return new WP_Error( 'api_connection_error', 'Falha ao conectar na API: ' . $response->get_error_message() );
+        $log[] = "ERRO DE CONEXÃO: " . $response->get_error_message();
+        return $response;
     }
     $body = wp_remote_retrieve_body( $response );
     $http_code = wp_remote_retrieve_response_code( $response  );
+    
+    $log[] = "HTTP Status Code: " . $http_code;
+    $log[] = "Resposta Bruta (início ): " . substr($body, 0, 500);
+
     if ( $http_code !== 200  ) {
-        return new WP_Error( 'api_http_error', "API retornou um erro HTTP {$http_code}. Resposta: " . substr($body, 0, 500 ) );
+        return new WP_Error( 'api_http_error', "A API retornou um erro HTTP {$http_code}."  );
     }
     $data = json_decode( $body, true );
     if ( json_last_error() !== JSON_ERROR_NONE ) {
-        return new WP_Error( 'api_json_error', 'Falha ao decodificar o JSON da API. Erro: ' . json_last_error_msg() );
+        return new WP_Error( 'api_json_error', 'Falha ao decodificar o JSON da API.' );
     }
     return $data;
 }
