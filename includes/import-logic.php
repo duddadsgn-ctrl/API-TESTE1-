@@ -44,7 +44,8 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
         // Busca direta pelo código do imóvel (usa POST)
         $log[] = "Buscando detalhes do imóvel com código: {$property_code}.";
         $endpoint = '/imoveis/detalhes';
-        $post_fields = [ 'imovel' => $property_code ];
+        // *** CORREÇÃO APLICADA AQUI ***
+        $post_fields = [ 'imovel' => $property_code, 'fields' => [] ];
         $response = vit_call_api_post( $api_url, $endpoint, $api_key, $post_fields );
         
         if ( is_wp_error( $response ) ) {
@@ -82,7 +83,8 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
 
         $log[] = "Imóvel encontrado na lista com código: {$property_code}. Buscando detalhes...";
         $endpoint_details = '/imoveis/detalhes';
-        $post_fields_details = [ 'imovel' => $property_code ];
+        // *** CORREÇÃO APLICADA AQUI ***
+        $post_fields_details = [ 'imovel' => $property_code, 'fields' => [] ];
         $response_details = vit_call_api_post( $api_url, $endpoint_details, $api_key, $post_fields_details );
 
         if ( is_wp_error( $response_details ) ) {
@@ -144,8 +146,6 @@ function vit_call_api_get_with_json_param( $base_url, $endpoint, $api_key, $para
     
     $url = add_query_arg( $query_args, $url );
 
-    // *** CORREÇÃO APLICADA AQUI ***
-    // Adicionando o header 'Accept' que a API exigiu.
     $args = [ 
         'method' => 'GET', 
         'timeout' => 30,
