@@ -242,45 +242,71 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
     }
 
     // ---- Chamada 2: fotos (nested spec) ----
-    // Tenta pedir Foto como nested object: {"Foto":["URLFoto","Destaque","Ordem","FotoGrande"]}
-    // Se isso falhar, tenta nomes alternativos
+    // Vista CRM usa nomes "Foto" e "FotoPequena" DENTRO do sub-objeto Foto.
+    // Formato real da API: {"Foto":[{"Foto":"url_grande","FotoPequena":"url_pq","Destaque":"Sim","Ordem":"1"},...]}
     $photo_attempts = [
-        [ 'Foto' => [ 'URLFoto', 'Destaque', 'Ordem', 'FotoGrande', 'URL' ] ],
-        [ 'Fotos' => [ 'URLFoto', 'Destaque', 'Ordem' ] ],
-        [ 'Imagens' => [ 'URLFoto', 'Destaque', 'Ordem' ] ],
+        // Nomes reais da Vista (primária)
+        [ 'Foto' => [ 'Foto', 'FotoPequena', 'Destaque', 'Ordem' ] ],
+        // Sem lista de subcampos (API devolve tudo que houver)
+        [ 'Foto' => [] ],
+        // Nomes alternativos antigos
+        [ 'Foto' => [ 'URLFoto', 'URLFotoPequena', 'Destaque', 'Ordem' ] ],
+        [ 'Fotos' => [ 'Foto', 'FotoPequena', 'Destaque', 'Ordem' ] ],
+        [ 'Imagens' => [ 'Foto', 'FotoPequena', 'Destaque', 'Ordem' ] ],
     ];
 
     $data_foto = null;
+    $used_key  = null;
     foreach ( $photo_attempts as $photo_spec ) {
-        $field_key = array_key_first( $photo_spec );
-        $url_foto  = add_query_arg( array_merge(
+        $field_key  = array_key_first( $photo_spec );
+        $subfields  = $photo_spec[ $field_key ];
+        $url_foto   = add_query_arg( array_merge(
             [ 'key' => $api_key, 'imovel' => $codigo ],
             $cat_arr,
             [ 'pesquisa' => wp_json_encode( [ 'fields' => [ $photo_spec ] ] ) ]
         ), $base );
 
-        $log[] = "Chamada 2/2 (fotos, tentando campo '{$field_key}')";
+        $log[] = sprintf(
+            "Chamada 2/2 (fotos): campo='%s' subfields=%s",
+            $field_key,
+            empty( $subfields ) ? '[] (todos)' : wp_json_encode( $subfields )
+        );
         $resp = vit_raw_get( $url_foto, $log );
 
-        if ( ! is_wp_error( $resp ) ) {
-            $data_foto = $resp;
-            break;
+        if ( ! is_wp_error( $resp ) && is_array( $resp ) ) {
+            // Procura o bloco de fotos na resposta
+            foreach ( [ 'Foto', 'Fotos', 'Imagens' ] as $fk ) {
+                if ( ! empty( $resp[ $fk ] ) && is_array( $resp[ $fk ] ) ) {
+                    $data_foto = $resp;
+                    $used_key  = $fk;
+                    break 2;
+                }
+            }
+            $log[] = "  resposta OK mas sem bloco de fotos (chaves: " . implode( ', ', array_keys( $resp ) ) . ")";
+            continue;
         }
-        $log[] = "  '{$field_key}' não disponível: " . $resp->get_error_message();
+        if ( is_wp_error( $resp ) ) {
+            $log[] = "  '{$field_key}' não disponível: " . $resp->get_error_message();
+        }
     }
 
     // Merge: começar com data_text, completar com data_foto se houver
     $merged = $data_text;
-    if ( $data_foto && is_array( $data_foto ) ) {
-        foreach ( [ 'Foto', 'Fotos', 'Imagens' ] as $fk ) {
-            if ( ! empty( $data_foto[ $fk ] ) ) {
-                $merged[ $fk ] = $data_foto[ $fk ];
-                $log[] = "Fotos recebidas no campo '{$fk}': " . count( $data_foto[ $fk ] );
-                break;
-            }
+    if ( $data_foto && $used_key ) {
+        $photos = $data_foto[ $used_key ];
+        $merged[ $used_key ] = $photos;
+        $merged['Foto']      = $photos; // normaliza: sempre disponível em "Foto"
+        $log[] = "Fotos recebidas no campo '{$used_key}': " . count( $photos );
+
+        // Log das chaves do primeiro item para debug
+        if ( ! empty( $photos[0] ) && is_array( $photos[0] ) ) {
+            $log[] = '  Chaves do 1º item de foto: ' . implode( ', ', array_keys( $photos[0] ) );
+            $first_preview = wp_json_encode( $photos[0], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+            if ( mb_strlen( $first_preview ) > 300 ) $first_preview = mb_substr( $first_preview, 0, 300 ) . '...';
+            $log[] = '  Exemplo: ' . $first_preview;
         }
     } else {
-        $log[] = 'Bloco de fotos não retornado pela API neste endpoint.';
+        $log[] = 'Bloco de fotos não retornado pela API neste endpoint (todas as tentativas falharam).';
     }
 
     return $merged;
@@ -553,8 +579,9 @@ function vit_process_property_images( $post_id, $data, &$log, &$counters ) {
         $idx  = $i + 1;
         $url  = null;
         $used_field = null;
-        foreach ( [ 'URL', 'URLFoto', 'Foto', 'FotoGrande', 'Link' ] as $field ) {
-            if ( ! empty( $photo[ $field ] ) ) {
+        // Ordem de preferência: tamanho grande primeiro, depois pequeno
+        foreach ( [ 'Foto', 'FotoGrande', 'URL', 'URLFoto', 'Link', 'FotoPequena', 'URLFotoPequena' ] as $field ) {
+            if ( ! empty( $photo[ $field ] ) && filter_var( $photo[ $field ], FILTER_VALIDATE_URL ) ) {
                 $url = $photo[ $field ];
                 $used_field = $field;
                 break;
@@ -563,7 +590,8 @@ function vit_process_property_images( $post_id, $data, &$log, &$counters ) {
         $destaque = ( ! empty( $photo['Destaque'] ) && strtolower( $photo['Destaque'] ) === 'sim' );
 
         if ( empty( $url ) ) {
-            $log[] = sprintf( "[IMAGEM %d/%d] URL ausente (campos testados: URL,URLFoto,Foto,FotoGrande,Link). PULADA.", $idx, $total );
+            $keys_found = is_array( $photo ) ? implode( ', ', array_keys( $photo ) ) : '(não-array)';
+            $log[] = sprintf( "[IMAGEM %d/%d] URL ausente. Chaves disponíveis: %s. PULADA.", $idx, $total, $keys_found );
             $counters['failed']++;
             continue;
         }
