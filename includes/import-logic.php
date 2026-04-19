@@ -44,8 +44,9 @@ function vit_import_property( $api_url, $api_key ) {
     $log[] = '';
     $log[] = '--- FASE 1: buscando lista de candidatos em /imoveis/listar ---';
 
+    // IMPORTANTE: /imoveis/listar NÃO aceita o campo "Foto" — ele só existe em /detalhes.
     $list_params = [
-        'fields'    => [ 'Codigo', 'TituloSite', 'Foto', 'Status', 'Categoria', 'Finalidade', 'Dormitorios', 'Cidade', 'Bairro' ],
+        'fields'    => [ 'Codigo', 'TituloSite', 'Status', 'Categoria', 'Finalidade', 'Dormitorios', 'Cidade', 'Bairro' ],
         'paginacao' => [ 'pagina' => 1, 'quantidade' => 20 ],
     ];
 
@@ -67,25 +68,27 @@ function vit_import_property( $api_url, $api_key ) {
     $log[] = '--- FASE 2: pontuando candidatos ---';
     $log[] = 'Total de candidatos recebidos: ' . count( $candidates );
 
+    // Pontuação baseada nos campos disponíveis em /listar (Foto só aparece em /detalhes).
     $scored = [];
     foreach ( $candidates as $item ) {
         $score = 0;
-        if ( ! empty( $item['TituloSite'] ) )  $score += 2;
-        if ( ! empty( $item['Foto'] ) )        $score += 3;
-        if ( ! empty( $item['Dormitorios'] ) ) $score += 1;
+        if ( ! empty( $item['TituloSite'] ) )  $score += 3;
+        if ( ! empty( $item['Dormitorios'] ) ) $score += 2;
         if ( ! empty( $item['Cidade'] ) )      $score += 1;
+        if ( ! empty( $item['Bairro'] ) )      $score += 1;
         if ( ! empty( $item['Status'] ) )      $score += 1;
+        if ( ! empty( $item['Categoria'] ) )   $score += 1;
 
         $codigo = $item['Codigo'] ?? '(sem código)';
         $scored[] = [ 'codigo' => $codigo, 'score' => $score, 'item' => $item ];
         $log[] = sprintf(
-            '  Candidato %s | score=%d | Categoria=%s | Status=%s | Cidade=%s | Foto=%s',
+            '  Candidato %s | score=%d | Categoria=%s | Status=%s | Cidade=%s | Dormitórios=%s',
             $codigo,
             $score,
             $item['Categoria']   ?? '-',
             $item['Status']      ?? '-',
             $item['Cidade']      ?? '-',
-            ! empty( $item['Foto'] ) ? 'sim' : 'não'
+            $item['Dormitorios'] ?? '-'
         );
     }
 
@@ -238,14 +241,21 @@ function vit_handle_api_response( $response, &$log ) {
     $log[] = 'HTTP Status: ' . $http_code;
     $log[] = 'Resposta   : ' . substr( $body, 0, 500 ) . ( strlen( $body ) > 500 ? ' (...truncado)' : '' );
 
+    $decoded = json_decode( $body, true );
+
     if ( $http_code !== 200 ) {
-        return new WP_Error( 'api_http_error', "HTTP {$http_code}" );
+        // Tenta extrair a mensagem de erro estruturada da API Vista.
+        $api_msg = '';
+        if ( is_array( $decoded ) && isset( $decoded['message'] ) ) {
+            $api_msg = is_array( $decoded['message'] ) ? implode( ' | ', $decoded['message'] ) : (string) $decoded['message'];
+        }
+        $log[] = 'ERRO da API: ' . ( $api_msg ?: '(sem mensagem)' );
+        return new WP_Error( 'api_http_error', "HTTP {$http_code}" . ( $api_msg ? " — {$api_msg}" : '' ) );
     }
-    $data = json_decode( $body, true );
     if ( json_last_error() !== JSON_ERROR_NONE ) {
         return new WP_Error( 'api_json_error', 'Falha ao decodificar JSON: ' . json_last_error_msg() );
     }
-    return $data;
+    return $decoded;
 }
 
 /**
