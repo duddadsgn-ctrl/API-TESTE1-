@@ -318,7 +318,7 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
  * - Aguarda 1s entre tentativas apenas para erros transientes de rede
  * - Loga: nº tentativa, tempo decorrido, tipo de erro
  */
-function vit_get_with_retry( $url, &$log, $timeout = 20, $max = 3 ) {
+function vit_get_with_retry( $url, &$log, $timeout = 45, $max = 3 ) {
     $transient_codes = [ 28, 6, 7, 35, 56 ]; // timeout, DNS, conn refused, SSL, recv
 
     $last = null;
