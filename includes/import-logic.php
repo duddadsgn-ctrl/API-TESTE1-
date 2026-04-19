@@ -165,35 +165,121 @@ function vit_extract_candidates( $response, &$log ) {
 }
 
 /**
- * Busca detalhes do imóvel via POST com pesquisa wrapper (formato correto desta API Vista).
- *
- * Diagnóstico do log anterior:
- *  - Tentativas 3 e 4 passaram da validação de Categoria mas falharam em "fields".
- *  - Causa: array_filter() removia fields:[] por ser array vazio (falsy).
- *  - Solução: pesquisa wrapper com fields sempre presente, sem array_filter.
+ * Busca detalhes tentando 6 variações de payload até encontrar a aceita por esta instância da API Vista.
  */
 function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidade, &$log ) {
-    $url = rtrim( $base_url, '/' ) . '/imoveis/detalhes';
-    $url = add_query_arg( [ 'key' => $api_key ], $url );
+    $base = rtrim( $base_url, '/' ) . '/imoveis/detalhes';
 
-    // Monta pesquisa sem array_filter — fields:[] DEVE ser mantido mesmo vazio.
-    $pesquisa = [ 'imovel' => $codigo, 'Categoria' => $categoria, 'fields' => [] ];
-    if ( ! empty( $finalidade ) ) {
-        $pesquisa['Finalidade'] = $finalidade;
+    $fields = [
+        'Codigo','TituloSite','DescricaoWeb',
+        'Bairro','BairroComercial','Cidade','UF','Latitude','Longitude',
+        'Status','Finalidade','Categoria','Moeda',
+        'Dormitorios','Suites','BanheiroSocialQtd','Vagas',
+        'AreaTotal','AreaPrivativa',
+        'ValorVenda','ValorLocacao','ValorIptu','ValorCondominio',
+        'Foto','Caracteristicas','InfraEstrutura','Imediacoes',
+        'CodigoCorretor','DestaqueWeb','Lancamento','FotoDestaque','ExibirNoSite',
+    ];
+
+    $cat_arr = [];
+    if ( ! empty( $categoria ) )  $cat_arr['Categoria']  = $categoria;
+    if ( ! empty( $finalidade ) ) $cat_arr['Finalidade'] = $finalidade;
+
+    $attempts = [
+        // A: imovel+Categoria no topo, fields dentro de pesquisa (padrão platypus)
+        [
+            'label' => 'A: imovel+Categoria no topo, pesquisa={fields}',
+            'method'=> 'POST',
+            'url'   => add_query_arg( [ 'key' => $api_key ], $base ),
+            'body'  => wp_json_encode( array_merge( [ 'imovel' => $codigo ], $cat_arr, [ 'pesquisa' => [ 'fields' => $fields ] ] ) ),
+            'ctype' => 'application/json',
+        ],
+        // B: tudo dentro de pesquisa, fields com valores
+        [
+            'label' => 'B: tudo em pesquisa (imovel+Categoria+fields)',
+            'method'=> 'POST',
+            'url'   => add_query_arg( [ 'key' => $api_key ], $base ),
+            'body'  => wp_json_encode( [ 'pesquisa' => array_merge( [ 'imovel' => $codigo ], $cat_arr, [ 'fields' => $fields ] ) ] ),
+            'ctype' => 'application/json',
+        ],
+        // C: flat (sem wrapper), fields com valores
+        [
+            'label' => 'C: flat sem wrapper, fields preenchido',
+            'method'=> 'POST',
+            'url'   => add_query_arg( [ 'key' => $api_key ], $base ),
+            'body'  => wp_json_encode( array_merge( [ 'imovel' => $codigo ], $cat_arr, [ 'fields' => $fields ] ) ),
+            'ctype' => 'application/json',
+        ],
+        // D: imovel+Categoria na URL, pesquisa={fields} no body
+        [
+            'label' => 'D: imovel+Categoria na URL, pesquisa={fields} no body',
+            'method'=> 'POST',
+            'url'   => add_query_arg( array_merge( [ 'key' => $api_key, 'imovel' => $codigo ], $cat_arr ), $base ),
+            'body'  => wp_json_encode( [ 'pesquisa' => [ 'fields' => $fields ] ] ),
+            'ctype' => 'application/json',
+        ],
+        // E: GET pesquisa=JSON (mesmo padrão de /listar)
+        [
+            'label' => 'E: GET pesquisa=JSON na query string',
+            'method'=> 'GET',
+            'url'   => add_query_arg( [ 'key' => $api_key, 'pesquisa' => wp_json_encode( array_merge( [ 'imovel' => $codigo ], $cat_arr, [ 'fields' => $fields ] ) ) ], $base ),
+            'body'  => '',
+            'ctype' => '',
+        ],
+        // F: form-encoded pesquisa=JSON com fields preenchidos
+        [
+            'label' => 'F: form-encoded pesquisa=JSON',
+            'method'=> 'POST',
+            'url'   => add_query_arg( [ 'key' => $api_key ], $base ),
+            'body'  => http_build_query( [ 'pesquisa' => wp_json_encode( array_merge( [ 'imovel' => $codigo ], $cat_arr, [ 'fields' => $fields ] ) ) ] ),
+            'ctype' => 'application/x-www-form-urlencoded',
+        ],
+    ];
+
+    $last_error = null;
+    foreach ( $attempts as $i => $attempt ) {
+        $log[] = '[DETALHES ' . $attempt['label'] . ']';
+
+        $headers = [ 'Accept' => 'application/json' ];
+        if ( ! empty( $attempt['ctype'] ) ) $headers['Content-Type'] = $attempt['ctype'];
+
+        if ( $attempt['method'] === 'GET' ) {
+            $raw = wp_remote_get( $attempt['url'], [ 'timeout' => 30, 'headers' => $headers ] );
+        } else {
+            $raw = wp_remote_post( $attempt['url'], [ 'timeout' => 30, 'headers' => $headers, 'body' => $attempt['body'] ] );
+        }
+
+        if ( is_wp_error( $raw ) ) {
+            $log[] = '  ERRO: ' . $raw->get_error_message();
+            $last_error = $raw;
+            continue;
+        }
+
+        $http  = wp_remote_retrieve_response_code( $raw );
+        $rbody = wp_remote_retrieve_body( $raw );
+        $dec   = json_decode( $rbody, true );
+
+        if ( $http !== 200 ) {
+            $msg = '';
+            if ( is_array( $dec ) && isset( $dec['message'] ) ) {
+                $msg = is_array( $dec['message'] ) ? implode( ' | ', $dec['message'] ) : (string) $dec['message'];
+            }
+            $log[]      = '  HTTP ' . $http . ( $msg ? " — {$msg}" : '' );
+            $last_error = new WP_Error( 'api_http_error', "HTTP {$http}" . ( $msg ? " — {$msg}" : '' ) );
+            continue;
+        }
+
+        if ( json_last_error() !== JSON_ERROR_NONE ) {
+            $log[]      = '  JSON inválido: ' . json_last_error_msg();
+            $last_error = new WP_Error( 'api_json_error', 'JSON inválido' );
+            continue;
+        }
+
+        $log[] = '  SUCESSO com variação ' . $attempt['label'][0] . '!';
+        return $dec;
     }
 
-    $body = wp_json_encode( [ 'pesquisa' => $pesquisa ] );
-
-    $log[] = 'Endpoint   : POST /imoveis/detalhes';
-    $log[] = 'Payload    : ' . $body;
-
-    $raw = wp_remote_post( $url, [
-        'timeout' => 30,
-        'headers' => [ 'Content-Type' => 'application/json', 'Accept' => 'application/json' ],
-        'body'    => $body,
-    ] );
-
-    return vit_handle_api_response( $raw, $log );
+    return $last_error ?? new WP_Error( 'api_all_failed', 'Todas as 6 variações falharam para /detalhes.' );
 }
 
 /**
