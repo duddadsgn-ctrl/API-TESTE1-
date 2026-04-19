@@ -15,18 +15,33 @@ function vit_handle_import_single_property() {
         wp_die( 'Você não tem permissão para executar esta ação.' );
     }
 
+    // Coleta e sanitiza os dados do formulário
     $api_url = esc_url_raw( $_POST['vit_api_url'] );
     $api_key = sanitize_text_field( $_POST['vit_api_key'] );
     $property_code = sanitize_text_field( $_POST['vit_property_code'] );
+    $api_filter_categoria = sanitize_text_field( $_POST['vit_api_filter_categoria'] );
+    $api_filter_finalidade = sanitize_text_field( $_POST['vit_api_filter_finalidade'] );
 
+    // Salva as opções para preenchimento futuro do formulário
     update_option( 'vit_api_url', $api_url );
     update_option( 'vit_api_key', $api_key );
     update_option( 'vit_property_code', $property_code );
+    update_option( 'vit_api_filter_categoria', $api_filter_categoria );
+    update_option( 'vit_api_filter_finalidade', $api_filter_finalidade );
 
-    $report = vit_import_property( $api_url, $api_key, $property_code );
+    // Monta o array de filtros para a API
+    $api_filters = [];
+    if ( ! empty( $api_filter_categoria ) ) {
+        $api_filters['Categoria'] = $api_filter_categoria;
+    }
+    if ( ! empty( $api_filter_finalidade ) ) {
+        $api_filters['Finalidade'] = $api_filter_finalidade;
+    }
+
+    // Executa a lógica de importação
+    $report = vit_import_property( $api_url, $api_key, $property_code, $api_filters );
 
     set_transient( 'vit_import_report', $report, 60 );
-
     wp_redirect( admin_url( 'admin.php?page=vista-imovel-teste' ) );
     exit;
 }
@@ -34,17 +49,16 @@ function vit_handle_import_single_property() {
 /**
  * Função principal que orquestra a importação do imóvel.
  */
-function vit_import_property( $api_url, $api_key, $property_code = '' ) {
+function vit_import_property( $api_url, $api_key, $property_code = '', $api_filters = [] ) {
     $log = [];
     $log[] = 'Iniciando processo de importação...';
     $log[] = 'Consultando API Vista...';
     $property_data = null;
 
     if ( ! empty( $property_code ) ) {
-        // Busca direta pelo código do imóvel (usa POST)
+        // Se um código é fornecido, a busca é direta para /detalhes via POST.
         $log[] = "Buscando detalhes do imóvel com código: {$property_code}.";
         $endpoint = '/imoveis/detalhes';
-        // *** CORREÇÃO APLICADA AQUI ***
         $post_fields = [ 'imovel' => $property_code, 'fields' => [] ];
         $response = vit_call_api_post( $api_url, $endpoint, $api_key, $post_fields );
         
@@ -55,19 +69,35 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
         $property_data = $response;
 
     } else {
-        // Busca o primeiro imóvel da lista (usa GET com JSON na URL e Header Accept)
+        // Se nenhum código é fornecido, busca na lista usando os filtros obrigatórios.
         $log[] = 'Buscando lista de imóveis para pegar o primeiro...';
         $endpoint_list = '/imoveis/listar';
-        $params = [ 'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ] ];
-        $response_list = vit_call_api_get_with_json_param( $api_url, $endpoint_list, $api_key, $params );
+        
+        // Monta o corpo da requisição para /listar
+        $list_body = [
+            'fields'    => [ 'Codigo' ], // Pedimos apenas o código na listagem para otimizar
+            'paginacao' => [ 'pagina' => 1, 'quantidade' => 1 ]
+        ];
+        
+        // Adiciona os filtros obrigatórios
+        if ( ! empty( $api_filters ) ) {
+            $list_body['filtro'] = $api_filters;
+        }
+
+        $log[] = "Endpoint: " . $endpoint_list;
+        $log[] = "Filtros enviados: " . json_encode($list_body, JSON_PRETTY_PRINT);
+
+        // A chamada para /listar é via POST, conforme a documentação.
+        $response_list = vit_call_api_post( $api_url, $endpoint_list, $api_key, $list_body );
 
         if ( is_wp_error( $response_list ) ) {
             $log[] = 'ERRO: ' . $response_list->get_error_message();
             return [ 'status' => 'error', 'log' => $log ];
         }
 
-        if ( empty( $response_list ) || ! is_array( $response_list ) ) {
-            $log[] = 'ERRO: A lista de imóveis retornou vazia ou em formato inesperado.';
+        if ( empty( $response_list ) || ! is_array( $response_list ) || isset($response_list['status']) ) {
+            $log[] = 'ERRO: A lista de imóveis retornou vazia ou em formato inesperado. Verifique se os filtros (Categoria) estão corretos.';
+            $log[] = 'Resposta da API: ' . json_encode($response_list);
             return [ 'status' => 'error', 'log' => $log ];
         }
         
@@ -77,13 +107,12 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
         $property_code = $first_property_key;
         
         if ( empty( $property_code ) ) {
-            $log[] = 'ERRO: Não foi possível encontrar um imóvel na listagem.';
+            $log[] = 'ERRO: Nenhum imóvel encontrado com os filtros fornecidos.';
             return [ 'status' => 'error', 'log' => $log ];
         }
 
-        $log[] = "Imóvel encontrado na lista com código: {$property_code}. Buscando detalhes...";
+        $log[] = "Imóvel encontrado na lista com código: {$property_code}. Buscando detalhes completos...";
         $endpoint_details = '/imoveis/detalhes';
-        // *** CORREÇÃO APLICADA AQUI ***
         $post_fields_details = [ 'imovel' => $property_code, 'fields' => [] ];
         $response_details = vit_call_api_post( $api_url, $endpoint_details, $api_key, $post_fields_details );
 
@@ -118,7 +147,7 @@ function vit_import_property( $api_url, $api_key, $property_code = '' ) {
 }
 
 /**
- * Faz a chamada para a API Vista usando POST (para /detalhes).
+ * Função unificada para chamar a API Vista usando POST.
  */
 function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [] ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
@@ -129,43 +158,14 @@ function vit_call_api_post( $base_url, $endpoint, $api_key, $post_fields = [] ) 
         'body'    => json_encode( $post_fields ),
     ];
     $response = wp_remote_post( $url, $args );
-    return vit_handle_api_response( $response );
-}
-
-/**
- * Faz a chamada para a API Vista usando GET com parâmetros JSON na URL (para /listar).
- */
-function vit_call_api_get_with_json_param( $base_url, $endpoint, $api_key, $params = [] ) {
-    $url = rtrim( $base_url, '/' ) . $endpoint;
     
-    $query_args = [ 'key' => $api_key ];
-    if ( ! empty( $params ) ) {
-        // A API espera os parâmetros de filtro e paginação em uma única chave 'pesquisa'
-        $query_args['pesquisa'] = json_encode($params);
-    }
-    
-    $url = add_query_arg( $query_args, $url );
-
-    $args = [ 
-        'method' => 'GET', 
-        'timeout' => 30,
-        'headers' => [ 'Accept' => 'application/json' ],
-    ];
-    $response = wp_remote_get( $url, $args );
-    return vit_handle_api_response( $response );
-}
-
-/**
- * Função unificada para tratar a resposta da API.
- */
-function vit_handle_api_response( $response ) {
     if ( is_wp_error( $response ) ) {
         return new WP_Error( 'api_connection_error', 'Falha ao conectar na API: ' . $response->get_error_message() );
     }
     $body = wp_remote_retrieve_body( $response );
     $http_code = wp_remote_retrieve_response_code( $response  );
     if ( $http_code !== 200  ) {
-        return new WP_Error( 'api_http_error', "API retornou um erro HTTP {$http_code}. Resposta: " . substr($body, 0, 300 ) );
+        return new WP_Error( 'api_http_error', "API retornou um erro HTTP {$http_code}. Resposta: " . substr($body, 0, 500 ) );
     }
     $data = json_decode( $body, true );
     if ( json_last_error() !== JSON_ERROR_NONE ) {
@@ -174,8 +174,9 @@ function vit_handle_api_response( $response ) {
     return $data;
 }
 
-// O restante do código permanece o mesmo.
 
+// O restante do código (get_or_create_post, update_fields, process_images) permanece o mesmo.
+// ... (as funções vit_get_or_create_property_post, vit_update_property_fields, etc. continuam aqui)
 function vit_get_or_create_property_post( $vista_code, &$log ) {
     $args = [ 'post_type' => 'imoveis', 'post_status' => 'any', 'meta_key' => '_vista_codigo', 'meta_value' => $vista_code, 'posts_per_page' => 1, 'fields' => 'ids' ];
     $query = new WP_Query( $args );
