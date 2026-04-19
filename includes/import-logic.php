@@ -518,6 +518,26 @@ function vit_update_property_fields( $post_id, $data, &$log, &$counters, $field_
         $counters['empty']++;
     }
 
+    // Valores monetários formatados em BRL (ex.: 4000000 -> "R$4.000.000")
+    $money_map = [
+        'valor_venda_formatado'      => 'ValorVenda',
+        'valor_locacao_formatado'    => 'ValorLocacao',
+        'valor_iptu_formatado'       => 'ValorIptu',
+        'valor_condominio_formatado' => 'ValorCondominio',
+    ];
+    foreach ( $money_map as $meta_key => $api_key ) {
+        $raw = $data[ $api_key ] ?? '';
+        $formatted = vit_format_brl( $raw );
+        if ( $formatted === '' ) {
+            $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" | - VAZIO/zero (ignorado)", $meta_key, (string) $raw );
+            $counters['empty']++;
+            continue;
+        }
+        update_post_meta( $post_id, $meta_key, $formatted );
+        $log[] = sprintf( "[VALOR] WP:'%s' | bruto=\"%s\" -> formatado=\"%s\" | OK SALVO", $meta_key, (string) $raw, $formatted );
+        $counters['saved']++;
+    }
+
     // Características, Infraestrutura, Imediações
     $feature_map = [
         'caracteristicas' => 'Caracteristicas',
@@ -704,4 +724,34 @@ function vit_sideload_image( $file_url, $post_id, $desc ) {
         return $id;
     }
     return (int) $id;
+}
+
+/**
+ * Formata um número como moeda BRL no padrão "R$4.000.000".
+ * Aceita string ou número. Retorna "" se valor for vazio, zero ou inválido.
+ * Mantém centavos apenas quando existirem (ex.: 1500.50 -> "R$1.500,50").
+ */
+function vit_format_brl( $value ) {
+    if ( $value === null || $value === '' ) return '';
+
+    // Normaliza: remove R$, espaços; troca vírgula decimal por ponto
+    $s = is_string( $value ) ? trim( $value ) : (string) $value;
+    $s = preg_replace( '/[^\d,.\-]/', '', $s );
+
+    // Se tem vírgula e ponto, assume formato BR (ponto = milhar, vírgula = decimal)
+    if ( strpos( $s, ',' ) !== false && strpos( $s, '.' ) !== false ) {
+        $s = str_replace( '.', '', $s );
+        $s = str_replace( ',', '.', $s );
+    } elseif ( strpos( $s, ',' ) !== false ) {
+        $s = str_replace( ',', '.', $s );
+    }
+
+    if ( ! is_numeric( $s ) ) return '';
+    $num = (float) $s;
+    if ( $num <= 0 ) return '';
+
+    // Mostra 2 casas só se houver fração; senão, inteiro
+    $has_cents = abs( $num - floor( $num ) ) > 0.0001;
+    $decimals  = $has_cents ? 2 : 0;
+    return 'R$' . number_format( $num, $decimals, ',', '.' );
 }
