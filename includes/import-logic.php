@@ -313,13 +313,53 @@ function vit_call_detalhes( $base_url, $api_key, $codigo, $categoria, $finalidad
 }
 
 /**
+ * Wrapper de GET com retry + log de conectividade.
+ * - 3 tentativas, timeout 20s cada (máx ~62s total, não trava o browser)
+ * - Aguarda 1s entre tentativas apenas para erros transientes de rede
+ * - Loga: nº tentativa, tempo decorrido, tipo de erro
+ */
+function vit_get_with_retry( $url, &$log, $timeout = 20, $max = 3 ) {
+    $transient_codes = [ 28, 6, 7, 35, 56 ]; // timeout, DNS, conn refused, SSL, recv
+
+    $last = null;
+    for ( $i = 1; $i <= $max; $i++ ) {
+        $t0   = microtime( true );
+        $resp = wp_remote_get( $url, [
+            'timeout' => $timeout,
+            'headers' => [ 'Accept' => 'application/json' ],
+        ] );
+        $elapsed = round( ( microtime( true ) - $t0 ) * 1000 );
+
+        if ( ! is_wp_error( $resp ) ) {
+            if ( $i > 1 ) {
+                $log[] = "  [CONECTIVIDADE] Tentativa {$i}/{$max}: OK em {$elapsed}ms.";
+            }
+            return $resp;
+        }
+
+        $msg  = $resp->get_error_message();
+        $code = (int) filter_var( $msg, FILTER_SANITIZE_NUMBER_INT );
+        $log[] = "  [CONECTIVIDADE] Tentativa {$i}/{$max}: FALHOU em {$elapsed}ms — {$msg}";
+
+        $is_transient = in_array( $code, $transient_codes, true )
+            || stripos( $msg, 'timeout' ) !== false
+            || stripos( $msg, 'resolve' ) !== false;
+
+        $last = $resp;
+        if ( ! $is_transient || $i === $max ) {
+            break;
+        }
+        $log[] = "  [CONECTIVIDADE] Aguardando 1s antes da tentativa " . ( $i + 1 ) . "/{$max}...";
+        sleep( 1 );
+    }
+    return $last;
+}
+
+/**
  * GET helper simples — retorna array decodificado ou WP_Error.
  */
 function vit_raw_get( $url, &$log ) {
-    $raw = wp_remote_get( $url, [
-        'timeout' => 30,
-        'headers' => [ 'Accept' => 'application/json' ],
-    ] );
+    $raw = vit_get_with_retry( $url, $log );
 
     if ( is_wp_error( $raw ) ) {
         $log[] = '  ERRO CONEXÃO: ' . $raw->get_error_message();
@@ -354,18 +394,15 @@ function vit_raw_get( $url, &$log ) {
 function vit_call_api_get( $base_url, $endpoint, $api_key, $params, &$log ) {
     $url = rtrim( $base_url, '/' ) . $endpoint;
     $url = add_query_arg( [
-        'key'      => $api_key,
-        'pesquisa' => wp_json_encode( $params ),
+        'key'       => $api_key,
+        'pesquisa'  => wp_json_encode( $params ),
         'showtotal' => 1,
     ], $url );
 
     $log[] = 'Endpoint   : GET ' . $endpoint;
     $log[] = 'Pesquisa   : ' . wp_json_encode( $params, JSON_UNESCAPED_UNICODE );
 
-    $response = wp_remote_get( $url, [
-        'timeout' => 30,
-        'headers' => [ 'Accept' => 'application/json' ],
-    ] );
+    $response = vit_get_with_retry( $url, $log );
     return vit_handle_api_response( $response, $log );
 }
 
